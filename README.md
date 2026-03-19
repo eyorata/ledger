@@ -6,14 +6,14 @@
 pip install -r requirements.txt
 
 # 2. Start PostgreSQL
-docker run -d -e POSTGRES_PASSWORD=apex -e POSTGRES_DB=apex_ledger -p 5432:5432 postgres:16
+docker run -d -e POSTGRES_PASSWORD=admin -e POSTGRES_DB=apex_ledger -p 5432:5432 postgres:16
 
 # 3. Set environment
 cp .env.example .env
 # Edit .env — add your ANTHROPIC_API_KEY
 
 # 4. Generate all data (companies + documents + seed events → DB)
-python datagen/generate_all.py --db-url postgresql://postgres:apex@localhost/apex_ledger
+python datagen/generate_all.py --db-url postgresql://postgres:admin@localhost/apex_ledger
 
 # 5. Validate schema (no DB needed)
 python datagen/generate_all.py --skip-db --skip-docs --validate-only
