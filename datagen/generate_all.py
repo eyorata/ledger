@@ -20,15 +20,15 @@ from datagen.schema_validator import SchemaValidator
 fake = Faker()
 
 SEED_SCENARIOS = [
-    ("SUBMITTED",             6),   # Docs requested, nothing uploaded yet
-    ("DOCUMENTS_UPLOADED",    5),   # Docs uploaded, agent not run yet
-    ("DOCUMENTS_PROCESSED",   4),   # Week 3 pipeline done, credit not started
-    ("CREDIT_COMPLETE",       3),   # Credit done, fraud not started
-    ("FRAUD_COMPLETE",        2),   # Fraud done, compliance not started
-    ("APPROVED",              5),   # Full happy path
-    ("DECLINED",              2),   # Agent-driven decline
-    ("DECLINED_COMPLIANCE",   1),   # REG-003 (Montana) hard block
-    ("REFERRED",              1),   # Low-confidence orchestrator → human review
+    ("SUBMITTED",             8),   # Docs requested, nothing uploaded yet
+    ("DOCUMENTS_UPLOADED",    7),   # Docs uploaded, agent not run yet
+    ("DOCUMENTS_PROCESSED",   6),   # Week 3 pipeline done, credit not started
+    ("CREDIT_COMPLETE",       4),   # Credit done, fraud not started
+    ("FRAUD_COMPLETE",        3),   # Fraud done, compliance not started
+    ("APPROVED",              8),   # Full happy path
+    ("DECLINED",              3),   # Agent-driven decline
+    ("DECLINED_COMPLIANCE",   2),   # REG-003 (Montana) hard block
+    ("REFERRED",              2),   # Low-confidence orchestrator → human review
 ]
 
 EVENT_STORE_SQL = """
@@ -246,9 +246,6 @@ def main():
             bs_variant = "scanned" if i%10==0 else "clean"
             generate_income_statement_pdf(c, y, str(d/f"income_statement_{y}.pdf"), inc_variant)
             generate_balance_sheet_pdf(c, y, str(d/f"balance_sheet_{y}.pdf"), bs_variant)
-            generate_application_proposal_pdf(c, f"APEX-PROP-{c.company_id}",
-                c.financials[-1]["total_revenue"]*random.uniform(0.10,0.35),
-                random.choice(c.loan_purposes), str(d/"application_proposal.pdf"))
             generate_financial_excel(c, str(d/"financial_statements.xlsx"))
             # CSV summary
             with open(str(d/"financial_summary.csv"),"w",newline="") as f:
@@ -256,7 +253,7 @@ def main():
                 for k,v in c.financials[-1].items():
                     if isinstance(v,(int,float)) and k!="fiscal_year":
                         w.writerow([k,v,2024,"USD"])
-            count += 5
+            count += 4
             if (i+1)%20==0: print(f"  ... {i+1}/{len(companies)} done")
         print(f"  [OK] {count} files in {args.docs_dir}/")
 

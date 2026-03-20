@@ -91,12 +91,12 @@ class EventSimulator:
         ))
         self._emit(app, DocumentUploadRequested(
             application_id=self.application_id,
-            required_document_types=[DocumentType.APPLICATION_PROPOSAL, DocumentType.INCOME_STATEMENT, DocumentType.BALANCE_SHEET],
+            required_document_types=[DocumentType.INCOME_STATEMENT, DocumentType.BALANCE_SHEET],
             deadline=self.t + timedelta(days=7), requested_by="system",
         ))
         self._emit(pkg, PackageCreated(
             package_id=self.application_id, application_id=self.application_id,
-            required_documents=[DocumentType.APPLICATION_PROPOSAL, DocumentType.INCOME_STATEMENT, DocumentType.BALANCE_SHEET],
+            required_documents=[DocumentType.INCOME_STATEMENT, DocumentType.BALANCE_SHEET],
             created_at=self._tick(seconds=20),
         ))
 
@@ -104,7 +104,6 @@ class EventSimulator:
         app, pkg = f"loan-{self.application_id}", f"docpkg-{self.application_id}"
         self._tick(hours=random.randint(2,48))
         for doc_type, fmt, suffix in [
-            (DocumentType.APPLICATION_PROPOSAL, DocumentFormat.PDF, "proposal.pdf"),
             (DocumentType.INCOME_STATEMENT, DocumentFormat.PDF, "income_stmt_2024.pdf"),
             (DocumentType.BALANCE_SHEET, DocumentFormat.PDF, "balance_sheet_2024.pdf"),
             (DocumentType.INCOME_STATEMENT, DocumentFormat.XLSX, "financials.xlsx"),
@@ -117,7 +116,7 @@ class EventSimulator:
                 filename=f"{self.application_id}_{suffix}",
                 file_path=f"documents/{self.company.company_id}/{self.application_id}_{suffix}",
                 file_size_bytes=random.randint(45_000,380_000),
-                file_hash=fh, fiscal_year=2024 if doc_type != DocumentType.APPLICATION_PROPOSAL else None,
+                file_hash=fh, fiscal_year=2024,
                 uploaded_at=self._tick(minutes=random.randint(1,10)), uploaded_by="applicant",
             ))
             self._emit(pkg, DocumentAdded(
