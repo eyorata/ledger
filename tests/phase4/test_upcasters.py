@@ -1,4 +1,5 @@
 import os
+import json
 from datetime import datetime, timezone
 
 import pytest
@@ -45,7 +46,9 @@ async def test_upcast_credit_analysis_immutability(store):
             "SELECT payload, event_version FROM events WHERE stream_id=$1 ORDER BY stream_position ASC LIMIT 1",
             stream_id,
         )
-        raw_payload = dict(row["payload"])
+        raw_payload = row["payload"]
+        if isinstance(raw_payload, str):
+            raw_payload = json.loads(raw_payload)
         raw_version = row["event_version"]
 
     loaded = await store.load_stream(stream_id)
@@ -60,7 +63,10 @@ async def test_upcast_credit_analysis_immutability(store):
             stream_id,
         )
         assert row2["event_version"] == raw_version
-        assert dict(row2["payload"]) == raw_payload
+        payload2 = row2["payload"]
+        if isinstance(payload2, str):
+            payload2 = json.loads(payload2)
+        assert payload2 == raw_payload
 
 
 @pytest.mark.asyncio
