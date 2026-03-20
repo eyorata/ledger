@@ -567,7 +567,7 @@ class InMemoryEventStore:
                     "event_version": event_dict.get("event_version", 1),
                     "payload": dict(event_dict.get("payload", {})),
                     "metadata": meta,
-                    "recorded_at": _datetime.utcnow().isoformat(),
+                    "recorded_at": _datetime.now(timezone.utc).isoformat(),
                 }
                 self._streams[stream_id].append(stored)
                 self._global.append(stored)
