@@ -43,3 +43,51 @@ CREATE TABLE outbox (
   published_at     TIMESTAMPTZ,
   attempts         SMALLINT NOT NULL DEFAULT 0
 );
+
+-- Projections
+CREATE TABLE application_summary (
+  application_id          TEXT PRIMARY KEY,
+  state                   TEXT,
+  applicant_id            TEXT,
+  requested_amount_usd    NUMERIC,
+  approved_amount_usd     NUMERIC,
+  risk_tier               TEXT,
+  fraud_score             NUMERIC,
+  compliance_status       TEXT,
+  decision                TEXT,
+  agent_sessions_completed TEXT[],
+  last_event_type         TEXT,
+  last_event_at           TIMESTAMPTZ,
+  human_reviewer_id       TEXT,
+  final_decision_at       TIMESTAMPTZ
+);
+
+CREATE TABLE agent_performance_ledger (
+  agent_id                TEXT NOT NULL,
+  model_version           TEXT NOT NULL,
+  analyses_completed      BIGINT NOT NULL DEFAULT 0,
+  decisions_generated     BIGINT NOT NULL DEFAULT 0,
+  avg_confidence_score    NUMERIC,
+  avg_duration_ms         NUMERIC,
+  approve_rate            NUMERIC NOT NULL DEFAULT 0,
+  decline_rate            NUMERIC NOT NULL DEFAULT 0,
+  refer_rate              NUMERIC NOT NULL DEFAULT 0,
+  human_override_rate     NUMERIC NOT NULL DEFAULT 0,
+  first_seen_at           TIMESTAMPTZ,
+  last_seen_at            TIMESTAMPTZ,
+  PRIMARY KEY (agent_id, model_version)
+);
+
+CREATE TABLE compliance_audit_current (
+  application_id          TEXT PRIMARY KEY,
+  state                   JSONB NOT NULL,
+  last_event_at           TIMESTAMPTZ
+);
+
+CREATE TABLE compliance_audit_history (
+  application_id          TEXT NOT NULL,
+  recorded_at             TIMESTAMPTZ NOT NULL,
+  state                   JSONB NOT NULL
+);
+
+CREATE INDEX idx_compliance_audit_history_app_time ON compliance_audit_history (application_id, recorded_at);

@@ -351,6 +351,35 @@ class EventStore:
                 "metadata": _coerce_json(row["metadata"]),
             }
 
+    async def save_checkpoint(self, projection_name: str, position: int) -> None:
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO projection_checkpoints(projection_name, last_position, updated_at)"
+                " VALUES($1, $2, NOW())"
+                " ON CONFLICT (projection_name) DO UPDATE"
+                " SET last_position = EXCLUDED.last_position, updated_at = NOW()",
+                projection_name,
+                position,
+            )
+
+    async def load_checkpoint(self, projection_name: str) -> int:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT last_position FROM projection_checkpoints WHERE projection_name=$1",
+                projection_name,
+            )
+            return row["last_position"] if row else 0
+
+    async def latest_event_info(self) -> tuple[int, datetime | None]:
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT global_position, recorded_at FROM events"
+                " ORDER BY global_position DESC LIMIT 1"
+            )
+            if not row:
+                return -1, None
+            return row["global_position"], row["recorded_at"]
+
     async def archive_stream(self, stream_id: str) -> None:
         async with self._pool.acquire() as conn:
             await conn.execute(
@@ -612,6 +641,12 @@ class InMemoryEventStore:
 
     async def load_checkpoint(self, projection_name: str) -> int:
         return self._checkpoints.get(projection_name, 0)
+
+    async def latest_event_info(self) -> tuple[int, _datetime | None]:
+        if not self._global:
+            return -1, None
+        last = self._global[-1]
+        return last["global_position"], last.get("recorded_at")
 
     async def archive_stream(self, stream_id: str) -> None:
         # No-op for in-memory store

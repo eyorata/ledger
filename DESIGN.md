@@ -50,3 +50,16 @@ Indexes:
 - Optional top-level columns for correlation_id and causation_id if you want indexable tracing without JSONB scans.
 - CHECK constraints for non-negative stream_position, current_version, event_version, and attempts.
 - Consider partitioning events by time or stream_id for large-scale datasets.
+
+# Phase 3 Projections Design
+
+## Projection SLOs (Lag Contract)
+- ApplicationSummary lag SLO: < 500ms in normal operation.
+- ComplianceAuditView lag SLO: < 2000ms in normal operation.
+Lag is defined as the time difference between the latest event recorded_at in the event store and the last event processed by a projection.
+
+## ComplianceAuditView Snapshot Strategy
+We store a full compliance state snapshot on every compliance event in `compliance_audit_history` (append-only), and keep the latest snapshot in `compliance_audit_current` for fast reads. Temporal queries (`get_compliance_at`) select the most recent snapshot at or before a timestamp. This strategy is simple, deterministic, and supports regulatory time-travel with minimal complexity because compliance event volume is low relative to full system events. For rebuilds, a shadow-table swap is used to avoid downtime for live reads.
+
+## Rebuild Without Downtime
+`rebuild_from_scratch()` writes to shadow tables and swaps them into place in a transaction to keep reads available during replays.
