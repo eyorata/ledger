@@ -820,4 +820,10 @@ __all__ = [
     "tool_generate_decision",
     "tool_record_human_review",
     "tool_run_integrity_check",
+    "resource_application_summary",
+    "resource_compliance",
+    "resource_audit_trail",
+    "resource_agent_performance",
+    "resource_agent_session",
+    "resource_health",
 ]
