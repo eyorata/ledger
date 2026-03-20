@@ -63,3 +63,18 @@ We store a full compliance state snapshot on every compliance event in `complian
 
 ## Rebuild Without Downtime
 `rebuild_from_scratch()` writes to shadow tables and swaps them into place in a transaction to keep reads available during replays.
+
+# Phase 4 Upcasting & Integrity
+
+## Upcaster Inference Strategy
+- CreditAnalysisCompleted v1→v2: model_version inferred from recorded_at (2026+ → `legacy-2026`, else `legacy-pre-2026`); confidence_score set to `null` because fabrication would pollute auditability; regulatory_basis inferred from rule sets active at recorded_at (here, `2026-Q1` for 2026+ and `2025-Q4` for earlier events).
+- DecisionGenerated v1→v2: model_versions reconstructed by loading each contributing agent session’s `AgentSessionStarted` event; performance implication is a lookup per session on read, acceptable for low-volume historical loads but should be cached or pre-joined for high-throughput replay.
+
+## Immutability Guarantee
+Upcasters run on read only. The immutability test verifies that the raw stored payload stays byte-identical while the loaded event is transparently upcasted to the latest version.
+
+## Audit Hash Chain
+Each `AuditIntegrityCheckRun` records a hash over the payloads of the next segment of events plus the previous integrity hash. We validate the existing chain by recomputing prior segments; any mismatch flags tampering. The audit stream is append-only and provides tamper-evident integrity checks.
+
+## Gas Town Memory Pattern
+Agent sessions are reconstructed by replaying the agent session stream, summarizing older events, and preserving verbatim the last three events plus any error events. If the last event indicates a partial output without completion, the context is flagged `NEEDS_RECONCILIATION` so the agent must resolve the partial state before proceeding.
