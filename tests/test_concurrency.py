@@ -42,10 +42,22 @@ async def test_double_decision_concurrency():
         results = await asyncio.gather(attempt(), attempt(), return_exceptions=True)
         successes = [r for r in results if isinstance(r, int)]
         errors = [r for r in results if isinstance(r, OptimisticConcurrencyError)]
+        print(f"Success count: {len(successes)} | Successes: {successes}")
+        if errors:
+            err = errors[0]
+            print(
+                "OCC error:",
+                f"stream_id={err.stream_id}",
+                f"expected={err.expected}",
+                f"actual={err.actual}",
+            )
         assert len(successes) == 1
         assert len(errors) == 1
 
         events = await store.load_stream("test-concurrency-001")
+        print(f"Total stream length: {len(events)}")
+        if events:
+            print(f"Winning event stream_position: {events[-1]['stream_position']}")
         assert len(events) == 4
         assert events[-1]["stream_position"] == 4
     finally:

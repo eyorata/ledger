@@ -39,10 +39,19 @@ class AgentSessionAggregate:
         et = event.get("event_type")
         if self.first_event_type is None:
             self.first_event_type = et
-        if et in ("AgentSessionStarted", "AgentContextLoaded"):
-            payload = event.get("payload", {})
-            self.model_version = payload.get("model_version") or self.model_version
-            self.context_loaded = True
+        handler = getattr(self, f"_on_{et}", None)
+        if handler:
+            handler(event)
+
+    def _on_AgentSessionStarted(self, event: dict) -> None:
+        payload = event.get("payload", {})
+        self.model_version = payload.get("model_version") or self.model_version
+        self.context_loaded = True
+
+    def _on_AgentContextLoaded(self, event: dict) -> None:
+        payload = event.get("payload", {})
+        self.model_version = payload.get("model_version") or self.model_version
+        self.context_loaded = True
 
     def assert_context_loaded(self) -> None:
         if not self.context_loaded or self.first_event_type not in ("AgentSessionStarted", "AgentContextLoaded"):
