@@ -63,6 +63,8 @@ async def handle_submit_application(
     cmd: SubmitApplicationCommand,
     store,
 ) -> None:
+    app = await LoanApplicationAggregate.load(store, cmd.application_id)
+
     new_event = ApplicationSubmitted(
         application_id=cmd.application_id,
         applicant_id=cmd.applicant_id,
@@ -78,7 +80,7 @@ async def handle_submit_application(
     await store.append(
         stream_id=f"loan-{cmd.application_id}",
         events=[new_event],
-        expected_version=-1,
+        expected_version=app.version,
         correlation_id=cmd.correlation_id,
         causation_id=cmd.causation_id,
     )
