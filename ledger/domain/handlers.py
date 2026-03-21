@@ -249,10 +249,11 @@ async def handle_start_agent_session(
         started_at=datetime.now(timezone.utc),
     )
     stream_id = f"agent-{cmd.agent_type}-{cmd.session_id}"
+    expected = await store.stream_version(stream_id)
     await store.append(
         stream_id=stream_id,
         events=[new_event],
-        expected_version=-1,
+        expected_version=expected,
         correlation_id=cmd.correlation_id,
         causation_id=cmd.causation_id,
     )
