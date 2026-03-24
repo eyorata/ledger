@@ -120,24 +120,21 @@ class CreditAnalysisAgent(BaseApexAgent):
         app_id = state["application_id"]
         errors = []
 
-        # Load LoanApplicationAggregate to get applicant_id and amounts
-        # TODO: implement LoanApplicationAggregate.load()
-        # app = await LoanApplicationAggregate.load(self.store, app_id)
-        # if app.state not in (ApplicationState.DOCUMENTS_PROCESSED, ApplicationState.CREDIT_ANALYSIS_REQUESTED):
-        #     errors.append(f"Expected DOCUMENTS_PROCESSED, got {app.state}")
-        # state["applicant_id"]         = app.applicant_id
-        # state["requested_amount_usd"] = float(app.requested_amount_usd)
-        # state["loan_purpose"]         = app.loan_purpose.value
+        # Load application details from loan stream
+        loan_events = await self.store.load_stream(f"loan-{app_id}")
+        submitted = next((e for e in loan_events if e.get("event_type") == "ApplicationSubmitted"), None)
+        if not submitted:
+            errors.append("Missing ApplicationSubmitted on loan stream")
+        else:
+            payload = submitted.get("payload", {})
+            state["applicant_id"] = payload.get("applicant_id")
+            state["requested_amount_usd"] = float(payload.get("requested_amount_usd", 0.0))
+            state["loan_purpose"] = payload.get("loan_purpose")
 
-        # PLACEHOLDER — remove when LoanApplicationAggregate is implemented
-        state["applicant_id"]         = f"COMP-001"
-        state["requested_amount_usd"] = 500_000.0
-        state["loan_purpose"]         = "working_capital"
-
-        # Verify package is ready
-        # TODO: pkg = await DocumentPackageAggregate.load(self.store, app_id)
-        # if not pkg.is_ready_for_analysis:
-        #     errors.append("Document package not ready")
+        # Verify document package is ready
+        pkg_events = await self.store.load_stream(f"docpkg-{app_id}")
+        if not any(e.get("event_type") == "PackageReadyForAnalysis" for e in pkg_events):
+            errors.append("Document package not ready (PackageReadyForAnalysis missing)")
 
         ms = int((time.time() - t) * 1000)
         if errors:
@@ -184,20 +181,18 @@ class CreditAnalysisAgent(BaseApexAgent):
         t = time.time()
         applicant_id = state["applicant_id"]
 
-        # Query Applicant Registry (read-only external database)
-        # TODO: implement RegistryClient methods
-        # profile   = await self.registry.get_company(applicant_id)
-        # financials = await self.registry.get_financial_history(applicant_id)
-        # flags     = await self.registry.get_compliance_flags(applicant_id)
-        # loans     = await self.registry.get_loan_relationships(applicant_id)
+        if not self.registry:
+            raise ValueError("Registry client not configured")
 
-        # PLACEHOLDER
-        profile    = {"company_id": applicant_id, "name": "Company",
-                      "industry": "technology", "trajectory": "STABLE",
-                      "legal_type": "LLC", "jurisdiction": "CA"}
-        financials: list[dict] = []
-        flags:      list[dict] = []
-        loans:      list[dict] = []
+        # Query Applicant Registry (read-only external database)
+        profile_obj = await self.registry.get_company(applicant_id)
+        financials_obj = await self.registry.get_financial_history(applicant_id)
+        flags_obj = await self.registry.get_compliance_flags(applicant_id)
+        loans = await self.registry.get_loan_relationships(applicant_id)
+
+        profile = profile_obj.__dict__ if profile_obj else {"company_id": applicant_id}
+        financials = [f.__dict__ for f in (financials_obj or [])]
+        flags = [f.__dict__ for f in (flags_obj or [])]
 
         ms = int((time.time() - t) * 1000)
         await self._record_tool_call(
@@ -220,7 +215,7 @@ class CreditAnalysisAgent(BaseApexAgent):
             data_hash=self._sha({"fins": financials, "flags": flags}),
             consumed_at=datetime.now(),
         ).to_store_dict()
-        await self._append_with_retry(f"credit-{state['application_id']}", [event])
+        await self._append_stream(f"credit-{state['application_id']}", event)
 
         await self._record_node_execution(
             "load_applicant_registry",
@@ -290,7 +285,7 @@ class CreditAnalysisAgent(BaseApexAgent):
             quality_flags_present=bool(quality_flags),
             consumed_at=datetime.now(),
         ).to_store_dict()
-        await self._append_with_retry(f"credit-{app_id}", [event])
+        await self._append_stream(f"credit-{app_id}", event)
 
         # Defer if facts are too incomplete
         critical = ["total_revenue", "net_income", "total_assets"]
@@ -302,7 +297,7 @@ class CreditAnalysisAgent(BaseApexAgent):
                 quality_issues=[f"Missing critical field: {f}" for f in missing_critical],
                 deferred_at=datetime.now(),
             ).to_store_dict()
-            await self._append_with_retry(f"credit-{app_id}", [defer_event])
+            await self._append_stream(f"credit-{app_id}", defer_event)
             raise ValueError(f"Credit analysis deferred: missing {missing_critical}")
 
         await self._record_node_execution(
@@ -472,10 +467,7 @@ Provide your analysis as JSON."""
         ).to_store_dict()
 
         # OCC-safe write to credit stream
-        positions = await self._append_with_retry(
-            f"credit-{app_id}", [credit_event],
-            causation_id=self.session_id,
-        )
+        await self._append_stream(f"credit-{app_id}", credit_event, causation_id=self.session_id)
 
         # Trigger next agent: append FraudScreeningRequested to loan stream
         fraud_trigger = FraudScreeningRequested(
@@ -483,11 +475,11 @@ Provide your analysis as JSON."""
             requested_at=datetime.now(),
             triggered_by_event_id=self.session_id,
         ).to_store_dict()
-        await self._append_with_retry(f"loan-{app_id}", [fraud_trigger])
+        await self._append_stream(f"loan-{app_id}", fraud_trigger)
 
         events_written = [
             {"stream_id": f"credit-{app_id}", "event_type": "CreditAnalysisCompleted",
-             "stream_position": positions[0] if positions else -1},
+             "stream_position": -1},
             {"stream_id": f"loan-{app_id}", "event_type": "FraudScreeningRequested",
              "stream_position": -1},
         ]
