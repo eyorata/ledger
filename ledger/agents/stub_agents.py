@@ -1040,7 +1040,7 @@ REGULATIONS = {
         "name": "Minimum Operating History",
         "version": "2026-Q1-v1",
         "is_hard_block": True,
-        "check": lambda co: (2024 - (co.get("founded_year") or 2024)) >= 2,
+        "check": lambda co: (2026 - (co.get("founded_year") or 2026)) >= 2,
         "failure_reason": "Business must have at least 2 years of operating history.",
         "remediation": None,
     },
@@ -1101,12 +1101,18 @@ class ComplianceAgent(BaseApexAgent):
         g = StateGraph(ComplianceState)
         g.add_node("validate_inputs",     self._node_validate_inputs)
         g.add_node("load_company_profile",self._node_load_profile)
-        g.add_node("evaluate_reg001",     lambda s: self._evaluate_rule(s, "REG-001"))
-        g.add_node("evaluate_reg002",     lambda s: self._evaluate_rule(s, "REG-002"))
-        g.add_node("evaluate_reg003",     lambda s: self._evaluate_rule(s, "REG-003"))
-        g.add_node("evaluate_reg004",     lambda s: self._evaluate_rule(s, "REG-004"))
-        g.add_node("evaluate_reg005",     lambda s: self._evaluate_rule(s, "REG-005"))
-        g.add_node("evaluate_reg006",     lambda s: self._evaluate_rule(s, "REG-006"))
+        async def _eval_001(s): return await self._evaluate_rule(s, "REG-001")
+        async def _eval_002(s): return await self._evaluate_rule(s, "REG-002")
+        async def _eval_003(s): return await self._evaluate_rule(s, "REG-003")
+        async def _eval_004(s): return await self._evaluate_rule(s, "REG-004")
+        async def _eval_005(s): return await self._evaluate_rule(s, "REG-005")
+        async def _eval_006(s): return await self._evaluate_rule(s, "REG-006")
+        g.add_node("evaluate_reg001",     _eval_001)
+        g.add_node("evaluate_reg002",     _eval_002)
+        g.add_node("evaluate_reg003",     _eval_003)
+        g.add_node("evaluate_reg004",     _eval_004)
+        g.add_node("evaluate_reg005",     _eval_005)
+        g.add_node("evaluate_reg006",     _eval_006)
         g.add_node("write_output",        self._node_write_output)
 
         g.set_entry_point("validate_inputs")
@@ -1142,16 +1148,24 @@ class ComplianceAgent(BaseApexAgent):
         loan_events = await self.store.load_stream(f"loan-{app_id}")
         applicant_id = None
         requested_amount = None
+        has_request = any(e.get("event_type") == "ComplianceCheckRequested" for e in loan_events)
         for e in loan_events:
             if e.get("event_type") == "ApplicationSubmitted":
                 p = e.get("payload", {})
                 applicant_id = p.get("applicant_id")
                 requested_amount = p.get("requested_amount_usd")
                 break
+        errors = []
         if not applicant_id:
-            state["errors"].append("Missing ApplicationSubmitted/applicant_id")
-            await self._record_node_execution("validate_inputs", ["application_id"], ["errors"], int((time.time()-t)*1000))
-            raise ValueError("Missing applicant_id")
+            errors.append("Missing ApplicationSubmitted/applicant_id")
+        if not has_request:
+            errors.append("Missing ComplianceCheckRequested on loan stream")
+
+        ms = int((time.time()-t)*1000)
+        if errors:
+            await self._record_input_failed([], errors)
+            await self._record_node_execution("validate_inputs", ["application_id"], ["errors"], ms)
+            raise ValueError(f"Input validation failed: {errors}")
 
         # Initiate compliance check
         await self._append_stream(
@@ -1164,7 +1178,8 @@ class ComplianceAgent(BaseApexAgent):
                 initiated_at=datetime.now().isoformat(),
             ).to_store_dict(),
         )
-        await self._record_node_execution("validate_inputs", ["application_id"], ["applicant_id"], int((time.time()-t)*1000))
+        await self._record_input_validated(["application_id","applicant_id"], ms)
+        await self._record_node_execution("validate_inputs", ["application_id"], ["applicant_id"], ms)
         return {**state, "applicant_id": applicant_id, "requested_amount_usd": requested_amount}
 
     async def _node_load_profile(self, state):
@@ -1302,14 +1317,25 @@ class ComplianceAgent(BaseApexAgent):
             )
             next_agent = "decision_orchestrator"
 
+        # Optional LLM summary (no effect on decision)
+        summary_text = f"verdict={verdict} passed={passed} failed={failed} noted={noted}"
+        try:
+            system = "You are a compliance officer. Summarize rule outcomes in 1-2 sentences."
+            user = json.dumps({"results": results, "verdict": verdict}, default=str)
+            content, ti, to, cost = await self._call_llm(system, user, max_tokens=256)
+            summary_text = content.strip()[:500]
+        except Exception:
+            ti = to = 0
+            cost = 0.0
+
         await self._record_output_written(
             events_written=[
                 {"stream_id": f"compliance-{app_id}", "event_type": "ComplianceCheckCompleted"},
                 {"stream_id": f"loan-{app_id}", "event_type": "DecisionRequested" if not has_block else "ApplicationDeclined"},
             ],
-            summary=f"verdict={verdict}",
+            summary=summary_text,
         )
-        await self._record_node_execution("write_output", ["rule_results"], ["output_events"], int((time.time()-t)*1000))
+        await self._record_node_execution("write_output", ["rule_results"], ["output_events"], int((time.time()-t)*1000), ti, to, cost)
         return {**state, "next_agent": next_agent}
 
 
