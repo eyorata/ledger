@@ -771,25 +771,33 @@ class FraudDetectionAgent(BaseApexAgent):
     async def _node_validate_inputs(self, state):
         t = time.time()
         app_id = state["application_id"]
+        errors = []
+
         loan_events = await self.store.load_stream(f"loan-{app_id}")
         applicant_id = None
+        has_request = any(e.get("event_type") == "FraudScreeningRequested" for e in loan_events)
         for e in loan_events:
             if e.get("event_type") == "ApplicationSubmitted":
                 applicant_id = e.get("payload", {}).get("applicant_id")
                 break
         if not applicant_id:
-            state["errors"].append("Missing ApplicationSubmitted/applicant_id")
-            await self._record_node_execution("validate_inputs", ["application_id"], ["errors"], int((time.time()-t)*1000))
-            raise ValueError("Missing applicant_id")
+            errors.append("Missing ApplicationSubmitted/applicant_id")
+        if not has_request:
+            errors.append("Missing FraudScreeningRequested on loan stream")
 
         doc_events = await self.store.load_stream(f"docpkg-{app_id}")
         has_facts = any(e.get("event_type") == "ExtractionCompleted" for e in doc_events)
         if not has_facts:
-            state["errors"].append("No ExtractionCompleted events found")
-            await self._record_node_execution("validate_inputs", ["application_id"], ["errors"], int((time.time()-t)*1000))
-            raise ValueError("Missing extracted facts")
+            errors.append("No ExtractionCompleted events found")
 
-        await self._record_node_execution("validate_inputs", ["application_id"], ["applicant_id"], int((time.time()-t)*1000))
+        ms = int((time.time()-t)*1000)
+        if errors:
+            await self._record_input_failed([], errors)
+            await self._record_node_execution("validate_inputs", ["application_id"], ["errors"], ms)
+            raise ValueError(f"Input validation failed: {errors}")
+
+        await self._record_input_validated(["application_id","applicant_id"], ms)
+        await self._record_node_execution("validate_inputs", ["application_id"], ["applicant_id"], ms)
         return {**state, "applicant_id": applicant_id}
 
     async def _node_load_facts(self, state):
@@ -801,10 +809,10 @@ class FraudDetectionAgent(BaseApexAgent):
             if e.get("event_type") != "ExtractionCompleted":
                 continue
             payload = e.get("payload", {})
-            doc_type = payload.get("document_type")
             f = payload.get("facts") or {}
-            if doc_type:
-                facts[doc_type] = f
+            for k, v in f.items():
+                if v is not None and k not in facts:
+                    facts[k] = v
         ms = int((time.time()-t)*1000)
         await self._record_tool_call("load_event_store_stream", f"docpkg-{app_id}", "ExtractionCompleted loaded", ms)
         await self._record_node_execution("load_document_facts", ["application_id"], ["extracted_facts"], ms)
@@ -813,6 +821,8 @@ class FraudDetectionAgent(BaseApexAgent):
     async def _node_cross_reference(self, state):
         t = time.time()
         applicant_id = state.get("applicant_id")
+        if not self.registry:
+            raise ValueError("Registry client not configured")
         profile = await self.registry.get_company(applicant_id)
         hist = await self.registry.get_financial_history(applicant_id)
         flags = await self.registry.get_compliance_flags(applicant_id, active_only=False)
@@ -820,56 +830,78 @@ class FraudDetectionAgent(BaseApexAgent):
         await self._record_tool_call("query_applicant_registry", f"company_id={applicant_id}", "profile + financial history loaded", ms)
         profile_dict = profile.__dict__ if profile else {}
         profile_dict["compliance_flags"] = [f.__dict__ for f in flags]
-        await self._record_node_execution("cross_reference_registry", ["applicant_id"], ["registry_profile","historical_financials"], ms)
-        return {**state, "registry_profile": profile_dict, "historical_financials": [h.__dict__ for h in hist]}
+        history = [h.__dict__ for h in hist]
+
+        # Compute deltas: current vs prior year for revenue/EBITDA/margins
+        current = state.get("extracted_facts") or {}
+        prior = history[-1] if history else {}
+        deltas = {}
+        for key in ("total_revenue", "ebitda", "gross_margin", "net_margin"):
+            cur = _safe_float(current.get(key))
+            prv = _safe_float(prior.get(key)) if isinstance(prior, dict) else None
+            if cur is not None and prv is not None and prv != 0:
+                deltas[key] = (cur - prv) / prv
+        signals = {
+            "current_facts": current,
+            "prior_year": prior,
+            "deltas": deltas,
+        }
+
+        await self._record_node_execution("cross_reference_registry", ["applicant_id"], ["registry_profile","historical_financials","fraud_signals"], ms)
+        return {**state, "registry_profile": profile_dict, "historical_financials": history, "fraud_signals": signals}
 
     async def _node_analyze(self, state):
         t = time.time()
         facts = state.get("extracted_facts") or {}
-        registry = state.get("registry_profile") or {}
         history = state.get("historical_financials") or []
+        signals = state.get("fraud_signals") or {}
 
-        current_revenue = None
-        for _, f in facts.items():
-            if isinstance(f, dict) and f.get("total_revenue") is not None:
-                current_revenue = _safe_float(f.get("total_revenue"))
-                break
+        SYSTEM = """You are a financial fraud analyst.
+Given the current-year extracted figures and 3-year historicals,
+identify anomalous gaps or inconsistencies. Return ONLY JSON:
+{
+  "anomalies": [
+    {"anomaly_type": "revenue_discrepancy" | "balance_sheet_inconsistency" | "unusual_submission_pattern" | "identity_mismatch" | "document_alteration_suspected",
+     "description": "...",
+     "severity": "LOW" | "MEDIUM" | "HIGH",
+     "evidence": "...",
+     "affected_fields": ["field"]
+    }
+  ]
+}
+"""
 
-        prior = history[-1] if history else {}
-        prior_revenue = _safe_float(prior.get("total_revenue")) if isinstance(prior, dict) else None
-        trajectory = registry.get("trajectory")
-
-        signals = []
-        score = 0.05
-        if current_revenue and prior_revenue and prior_revenue > 0:
-            gap = abs(current_revenue - prior_revenue) / prior_revenue
-            if gap > 0.40 and trajectory not in ("GROWTH", "RECOVERING"):
-                signals.append({"type": "REVENUE_DISCREPANCY", "severity": "HIGH", "evidence": f"Revenue gap {gap:.2f}"})
-                score += 0.25
-
-        # Balance sheet consistency
-        for f in facts.values():
-            if not isinstance(f, dict):
-                continue
-            assets = _safe_float(f.get("total_assets"))
-            liab = _safe_float(f.get("total_liabilities"))
-            equity = _safe_float(f.get("total_equity"))
-            if assets and liab is not None and equity is not None:
-                diff = abs(assets - (liab + equity)) / assets
-                if diff > 0.02:
-                    signals.append({"type": "BALANCE_SHEET_INCONSISTENCY", "severity": "MEDIUM", "evidence": f"Balance mismatch {diff:.2f}"})
-                    score += 0.15
-                break
+        USER = json.dumps(
+            {
+                "current_facts": facts,
+                "history": history,
+                "signals": signals,
+            },
+            indent=2,
+            default=str,
+        )
 
         anomalies = []
-        for s in signals:
-            if s["severity"] in ("MEDIUM", "HIGH"):
-                anomalies.append(s)
+        ti = to = 0
+        cost = 0.0
+        try:
+            content, ti, to, cost = await self._call_llm(SYSTEM, USER, max_tokens=512)
+            data = _parse_json(content) or {}
+            anomalies = data.get("anomalies") or []
+        except Exception:
+            anomalies = []
 
-        score = min(score, 1.0)
+        # Compute fraud_score from anomaly severities
+        weight = {"LOW": 0.10, "MEDIUM": 0.25, "HIGH": 0.45}
+        fraud_score = 0.0
+        for a in anomalies:
+            sev = str(a.get("severity", "LOW")).upper()
+            fraud_score += weight.get(sev, 0.10)
+        fraud_score = min(fraud_score, 1.0)
+
         ms = int((time.time()-t)*1000)
-        await self._record_node_execution("analyze_fraud_patterns", ["extracted_facts","historical_financials"], ["fraud_score","anomalies"], ms)
-        return {**state, "fraud_signals": signals, "fraud_score": score, "anomalies": anomalies}
+        await self._record_node_execution("analyze_fraud_patterns", ["extracted_facts","historical_financials"], ["fraud_score","anomalies"], ms, ti, to, cost)
+        return {**state, "fraud_score": fraud_score, "anomalies": anomalies}
 
     async def _node_write_output(self, state):
         t = time.time()
@@ -898,12 +930,15 @@ class FraudDetectionAgent(BaseApexAgent):
         ).to_store_dict())
 
         for a in anomalies:
+            at = str(a.get("anomaly_type", "")).lower()
+            if at not in {t.value for t in FraudAnomalyType}:
+                at = FraudAnomalyType.DOCUMENT_ALTERATION_SUSPECTED.value
             anomaly = FraudAnomaly(
-                anomaly_type=FraudAnomalyType[a["type"]],
-                description=a.get("evidence", ""),
-                severity=a.get("severity", "MEDIUM"),
+                anomaly_type=FraudAnomalyType(at),
+                description=a.get("description", a.get("evidence", "")),
+                severity=str(a.get("severity", "MEDIUM")).upper(),
                 evidence=a.get("evidence", ""),
-                affected_fields=[],
+                affected_fields=a.get("affected_fields", []) or [],
             )
             await self._append_stream(stream_id, FraudAnomalyDetected(
                 application_id=app_id,
