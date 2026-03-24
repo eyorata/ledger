@@ -15,7 +15,8 @@ Pattern: follow CreditAnalysisAgent exactly. Same build_graph() structure,
 same _record_node_execution() calls, same _append_with_retry() for domain writes.
 """
 from __future__ import annotations
-import time, json, os
+import time, json, os, re, requests
+from pathlib import Path
 from datetime import datetime
 from decimal import Decimal
 from typing import TypedDict
@@ -54,11 +55,121 @@ from ledger.schema.events import (
     DocumentFormat,
 )
 
+QUALITY_SYSTEM_PROMPT = """
+You are a financial document quality analyst. You receive structured data
+extracted from a company's financial statements.
+
+Check ONLY:
+1. Internal consistency (Gross Profit = Revenue - COGS, Assets = Liabilities + Equity)
+2. Implausible values (margins > 80%, negative equity without note)
+3. Critical missing fields (total_revenue, net_income, total_assets, total_liabilities)
+
+Return JSON: {"overall_confidence": float, "is_coherent": bool,
+  "anomalies": [str], "critical_missing_fields": [str],
+  "reextraction_recommended": bool, "auditor_notes": str}
+
+DO NOT make credit or lending decisions. DO NOT suggest loan outcomes.
+"""
+
 def _safe_float(v, default=None):
     try:
         return float(v)
     except Exception:
         return default
+
+def _refinery_paths():
+    root = os.getenv(
+        "DOCUMENT_REFINERY_ROOT",
+        r"C:\Users\user\Documents\tenx_academy\document-refinery\document-refinery",
+    )
+    venv = os.getenv(
+        "DOCUMENT_REFINERY_VENV",
+        r"C:\Users\user\Documents\tenx_academy\document-refinery\document-refinery\.venv",
+    )
+    py = os.path.join(venv, "Scripts", "python.exe")
+    return root, py
+
+def _run_document_refinery(file_path: str) -> dict:
+    refinery_api_url = os.getenv("DOCUMENT_REFINERY_API_URL", "http://localhost:8000/process_document")
+    try:
+        with open(file_path, "rb") as f:
+            files = {"file": (os.path.basename(file_path), f, "application/pdf")}
+            response = requests.post(refinery_api_url, files=files, timeout=180)
+            response.raise_for_status()
+            return response.json()
+    except Exception as e:
+        print(f"Document refinery API call failed: {e}")
+        return {}
+
+def _extract_text_from_refinery(payload: dict) -> str:
+    extracted = payload.get("extracted") or {}
+    blocks = extracted.get("text_blocks") or []
+    if blocks:
+        return blocks[0].get("content") or ""
+    chunks = payload.get("chunks") or []
+    if chunks:
+        return chunks[0].get("content") or ""
+    return ""
+
+_LINE_RE = re.compile(r"^(?P<label>[A-Za-z &/]+)\s+\$?(?P<val>[-(]?[0-9,]+\.?\d*)\)?$", re.M)
+
+def _parse_money(s: str) -> float | None:
+    if s is None:
+        return None
+    s = s.replace(",", "")
+    neg = s.startswith("(") and s.endswith(")")
+    s = s.strip("()")
+    try:
+        v = float(s)
+        return -v if neg else v
+    except Exception:
+        return None
+
+def _parse_line_items(text: str) -> dict[str, float | None]:
+    items: dict[str, float | None] = {}
+    for m in _LINE_RE.finditer(text or ""):
+        label = m.group("label").strip().lower()
+        val = _parse_money(m.group("val"))
+        items[label] = val
+    return items
+
+def _parse_income_statement_text(text: str) -> dict:
+    items = _parse_line_items(text)
+    return {
+        "total_revenue": items.get("revenue"),
+        "gross_profit": items.get("gross profit"),
+        "operating_income": items.get("operating income (ebit)") or items.get("operating income"),
+        "ebitda": items.get("ebitda"),
+        "interest_expense": items.get("interest expense"),
+        "depreciation_amortization": items.get("depreciation & amortization"),
+        "net_income": items.get("net income"),
+    }
+
+def _parse_balance_sheet_text(text: str) -> dict:
+    items = _parse_line_items(text)
+    return {
+        "total_assets": items.get("total assets"),
+        "total_liabilities": items.get("total liabilities"),
+        "total_equity": items.get("total equity"),
+        "current_assets": items.get("current assets"),
+        "current_liabilities": items.get("current liabilities"),
+        "cash_and_equivalents": items.get("cash and equivalents"),
+        "accounts_receivable": items.get("accounts receivable"),
+        "inventory": items.get("inventory"),
+        "long_term_debt": items.get("long term debt"),
+    }
+
+def _parse_json(text: str) -> dict:
+    try:
+        return json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if not m:
+            return {}
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            return {}
 
 
 # ─── DOCUMENT PROCESSING AGENT ───────────────────────────────────────────────
@@ -158,17 +269,37 @@ class DocumentProcessingAgent(BaseApexAgent):
                     "file_path": p.get("file_path"),
                 })
 
-        req = {DocumentType.INCOME_STATEMENT.value, DocumentType.BALANCE_SHEET.value}
-        got = {d["document_type"] for d in uploaded if d.get("document_type")}
-        missing = req - got
-        if missing:
-            state["errors"].append(f"Missing required documents: {sorted(missing)}")
-            await self._record_node_execution("validate_inputs", ["application_id"], ["errors"], int((time.time()-t)*1000))
-            raise ValueError(f"Missing required documents: {sorted(missing)}")
+        # Keep latest upload per document_type (by stream_position order)
+        latest_by_type: dict[str, dict] = {}
+        for d in uploaded:
+            dt = d.get("document_type")
+            if not dt:
+                continue
+            latest_by_type[dt] = d
+        deduped = list(latest_by_type.values())
 
-        await self._record_node_execution("validate_inputs", ["application_id"], ["document_paths"], int((time.time()-t)*1000))
-        return {**state, "document_ids":[d["document_id"] for d in uploaded],
-                "document_paths": uploaded}
+        req = {DocumentType.INCOME_STATEMENT.value, DocumentType.BALANCE_SHEET.value}
+        got = {d["document_type"] for d in deduped if d.get("document_type")}
+        missing = req - got
+        errors = []
+        if missing:
+            errors.append(f"Missing required documents: {sorted(missing)}")
+
+        # Ensure package has not already been processed
+        pkg_events = await self.store.load_stream(f"docpkg-{app_id}")
+        if any(e.get("event_type") == "PackageReadyForAnalysis" for e in pkg_events):
+            errors.append("Document package already processed (PackageReadyForAnalysis exists)")
+
+        ms = int((time.time()-t)*1000)
+        if errors:
+            await self._record_input_failed([], errors)
+            await self._record_node_execution("validate_inputs", ["application_id"], ["errors"], ms)
+            raise ValueError(f"Input validation failed: {errors}")
+
+        await self._record_input_validated(["application_id","document_ids","file_paths"], ms)
+        await self._record_node_execution("validate_inputs", ["application_id"], ["document_paths"], ms)
+        return {**state, "document_ids":[d["document_id"] for d in deduped],
+                "document_paths": deduped}
 
     async def _node_validate_formats(self, state):
         t = time.time()
@@ -197,6 +328,33 @@ class DocumentProcessingAgent(BaseApexAgent):
                 continue
             ext = os.path.splitext(path)[1].lower().lstrip(".")
             detected = ext if ext else "unknown"
+            # Basic format validation (no external deps)
+            is_valid = True
+            if ext == "pdf":
+                try:
+                    with open(path, "rb") as f:
+                        header = f.read(4)
+                    if header != b"%PDF":
+                        is_valid = False
+                except Exception:
+                    is_valid = False
+            elif ext in ("xlsx", "csv"):
+                # extension check only for now
+                is_valid = True
+            else:
+                is_valid = False
+
+            if not is_valid:
+                await self._append_stream(
+                    f"docpkg-{app_id}",
+                    DocumentFormatRejected(
+                        package_id=app_id,
+                        document_id=d.get("document_id") or "",
+                        rejection_reason="INVALID_FORMAT",
+                        rejected_at=datetime.now().isoformat(),
+                    ).to_store_dict(),
+                )
+                continue
             await self._append_stream(
                 f"docpkg-{app_id}",
                 DocumentFormatValidated(
@@ -245,7 +403,17 @@ class DocumentProcessingAgent(BaseApexAgent):
             ).to_store_dict(),
         )
         try:
-            facts = self._load_financial_summary(doc.get("file_path"))
+            raw = _run_document_refinery(doc.get("file_path") or "")
+            text = _extract_text_from_refinery(raw)
+            facts = _parse_income_statement_text(text)
+
+            field_conf: dict = {}
+            notes: list[str] = []
+            for key in ("total_revenue", "net_income", "ebitda"):
+                if facts.get(key) is None:
+                    field_conf[key] = 0.0
+                    notes.append(f"Missing {key} from extraction")
+
             ff = FinancialFacts(
                 total_revenue=facts.get("total_revenue"),
                 gross_profit=facts.get("gross_profit"),
@@ -254,7 +422,10 @@ class DocumentProcessingAgent(BaseApexAgent):
                 interest_expense=facts.get("interest_expense"),
                 depreciation_amortization=facts.get("depreciation_amortization"),
                 net_income=facts.get("net_income"),
+                field_confidence=field_conf,
+                extraction_notes=notes,
             )
+            tables = (raw.get("extracted") or {}).get("tables") or []
             await self._append_stream(
                 f"docpkg-{app_id}",
                 ExtractionCompleted(
@@ -262,13 +433,13 @@ class DocumentProcessingAgent(BaseApexAgent):
                     document_id=doc_id,
                     document_type=DocumentType.INCOME_STATEMENT,
                     facts=ff,
-                    raw_text_length=2000,
-                    tables_extracted=3,
-                    processing_ms=2500,
+                    raw_text_length=len(text or ""),
+                    tables_extracted=len(tables),
+                    processing_ms=int((time.time()-t)*1000),
                     completed_at=datetime.now().isoformat(),
                 ).to_store_dict(),
             )
-            await self._record_tool_call("week3_extraction_pipeline", doc.get("file_path",""), "income_statement facts", int((time.time()-t)*1000))
+            await self._record_tool_call("document_refinery_api", doc.get("file_path",""), "income_statement facts", int((time.time()-t)*1000))
             await self._record_node_execution("extract_income_statement", ["document_paths"], ["extraction_results"], int((time.time()-t)*1000))
             return state
         except Exception as e:
@@ -309,7 +480,17 @@ class DocumentProcessingAgent(BaseApexAgent):
             ).to_store_dict(),
         )
         try:
-            facts = self._load_financial_summary(doc.get("file_path"))
+            raw = _run_document_refinery(doc.get("file_path") or "")
+            text = _extract_text_from_refinery(raw)
+            facts = _parse_balance_sheet_text(text)
+
+            field_conf: dict = {}
+            notes: list[str] = []
+            for key in ("total_assets", "total_liabilities", "total_equity"):
+                if facts.get(key) is None:
+                    field_conf[key] = 0.0
+                    notes.append(f"Missing {key} from extraction")
+
             ff = FinancialFacts(
                 total_assets=facts.get("total_assets"),
                 total_liabilities=facts.get("total_liabilities"),
@@ -320,7 +501,10 @@ class DocumentProcessingAgent(BaseApexAgent):
                 accounts_receivable=facts.get("accounts_receivable"),
                 inventory=facts.get("inventory"),
                 long_term_debt=facts.get("long_term_debt"),
+                field_confidence=field_conf,
+                extraction_notes=notes,
             )
+            tables = (raw.get("extracted") or {}).get("tables") or []
             await self._append_stream(
                 f"docpkg-{app_id}",
                 ExtractionCompleted(
@@ -328,13 +512,13 @@ class DocumentProcessingAgent(BaseApexAgent):
                     document_id=doc_id,
                     document_type=DocumentType.BALANCE_SHEET,
                     facts=ff,
-                    raw_text_length=2000,
-                    tables_extracted=3,
-                    processing_ms=2500,
+                    raw_text_length=len(text or ""),
+                    tables_extracted=len(tables),
+                    processing_ms=int((time.time()-t)*1000),
                     completed_at=datetime.now().isoformat(),
                 ).to_store_dict(),
             )
-            await self._record_tool_call("week3_extraction_pipeline", doc.get("file_path",""), "balance_sheet facts", int((time.time()-t)*1000))
+            await self._record_tool_call("document_refinery_api", doc.get("file_path",""), "balance_sheet facts", int((time.time()-t)*1000))
             await self._record_node_execution("extract_balance_sheet", ["document_paths"], ["extraction_results"], int((time.time()-t)*1000))
             return state
         except Exception as e:
@@ -361,28 +545,76 @@ class DocumentProcessingAgent(BaseApexAgent):
         # 6. If critical_missing_fields: add to state["quality_flags"]
         # 7. await self._record_node_execution("assess_quality", ..., ms, ti, to, cost)
         app_id = state["application_id"]
-        # Simple coherence check using financial_summary.csv
-        facts = self._load_financial_summary(None)
-        total_assets = facts.get("total_assets") or 0.0
-        total_liabilities = facts.get("total_liabilities") or 0.0
-        total_equity = facts.get("total_equity") or 0.0
-        diff = abs(total_assets - (total_liabilities + total_equity))
-        is_coherent = total_assets == 0 or (diff / total_assets) < 0.02
+
+        pkg_events = await self.store.load_stream(f"docpkg-{app_id}")
+        extraction_events = [e for e in pkg_events if e.get("event_type") == "ExtractionCompleted"]
+        merged: dict = {}
+        for ev in extraction_events:
+            facts = (ev.get("payload") or {}).get("facts") or {}
+            for k, v in facts.items():
+                if v is not None and k not in merged:
+                    merged[k] = v
+
+        critical_missing = [
+            f for f in ("total_revenue", "net_income", "total_assets", "total_liabilities")
+            if merged.get(f) is None
+        ]
+
+        user = json.dumps(
+            {"facts": merged, "critical_missing_fields": critical_missing},
+            indent=2,
+            default=str,
+        )
+
+        try:
+            content, ti, to, cost = await self._call_llm(QUALITY_SYSTEM_PROMPT, user, max_tokens=512)
+            qa = _parse_json(content) or {}
+        except Exception:
+            qa = {}
+            ti = to = 0
+            cost = 0.0
+
+        if not qa:
+            total_assets = merged.get("total_assets") or 0.0
+            total_liabilities = merged.get("total_liabilities") or 0.0
+            total_equity = merged.get("total_equity") or 0.0
+            diff = abs(total_assets - (total_liabilities + total_equity))
+            is_coherent = total_assets == 0 or (diff / total_assets) < 0.02
+            qa = {
+                "overall_confidence": 0.9 if is_coherent else 0.6,
+                "is_coherent": is_coherent,
+                "anomalies": [] if is_coherent else ["BALANCE_SHEET_MISMATCH"],
+                "critical_missing_fields": critical_missing,
+                "reextraction_recommended": not is_coherent,
+                "auditor_notes": "Fallback coherence check (LLM unavailable or unparseable)",
+            }
+
         await self._append_stream(
             f"docpkg-{app_id}",
             QualityAssessmentCompleted(
                 package_id=app_id,
                 document_id=f"doc-{uuid4().hex[:8]}",
-                overall_confidence=0.9 if is_coherent else 0.6,
-                is_coherent=is_coherent,
-                anomalies=[] if is_coherent else ["BALANCE_SHEET_MISMATCH"],
-                critical_missing_fields=[],
-                reextraction_recommended=not is_coherent,
-                auditor_notes="Automated coherence check",
+                overall_confidence=float(qa.get("overall_confidence", 0.7)),
+                is_coherent=bool(qa.get("is_coherent", False)),
+                anomalies=qa.get("anomalies", []) or [],
+                critical_missing_fields=qa.get("critical_missing_fields", []) or [],
+                reextraction_recommended=bool(qa.get("reextraction_recommended", False)),
+                auditor_notes=qa.get("auditor_notes", ""),
                 assessed_at=datetime.now().isoformat(),
             ).to_store_dict(),
         )
-        await self._record_node_execution("assess_quality", ["extraction_results"], ["quality_assessment"], int((time.time()-t)*1000))
+        await self._append_stream(
+            f"docpkg-{app_id}",
+            PackageReadyForAnalysis(
+                package_id=app_id,
+                application_id=app_id,
+                documents_processed=len(extraction_events),
+                has_quality_flags=bool(qa.get("anomalies") or qa.get("critical_missing_fields")),
+                quality_flag_count=len(qa.get("anomalies", []) or []) + len(qa.get("critical_missing_fields", []) or []),
+                ready_at=datetime.now().isoformat(),
+            ).to_store_dict(),
+        )
+        await self._record_node_execution("assess_quality", ["extraction_results"], ["quality_assessment"], int((time.time()-t)*1000), ti, to, cost)
         return state
 
     async def _node_write_output(self, state):
@@ -395,17 +627,6 @@ class DocumentProcessingAgent(BaseApexAgent):
         # 5. return {**state, "next_agent": "credit_analysis"}
         app_id = state["application_id"]
         await self._append_stream(
-            f"docpkg-{app_id}",
-            PackageReadyForAnalysis(
-                package_id=app_id,
-                application_id=app_id,
-                documents_processed=2,
-                has_quality_flags=False,
-                quality_flag_count=0,
-                ready_at=datetime.now().isoformat(),
-            ).to_store_dict(),
-        )
-        await self._append_stream(
             f"loan-{app_id}",
             CreditAnalysisRequested(
                 application_id=app_id,
@@ -416,7 +637,6 @@ class DocumentProcessingAgent(BaseApexAgent):
         )
         await self._record_output_written(
             [
-                {"stream_id": f"docpkg-{app_id}", "event_type": "PackageReadyForAnalysis"},
                 {"stream_id": f"loan-{app_id}", "event_type": "CreditAnalysisRequested"},
             ],
             "Document processing complete; credit analysis requested.",

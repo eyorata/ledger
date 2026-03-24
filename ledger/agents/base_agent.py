@@ -78,6 +78,18 @@ class BaseApexAgent(ABC):
             "tool_input_summary":inp,"tool_output_summary":out,"tool_duration_ms":ms,
             "called_at":datetime.now().isoformat()}})
 
+    async def _record_input_validated(self, inputs_validated: list[str], ms: int):
+        await self._append_session({"event_type":"AgentInputValidated","event_version":1,"payload":{
+            "session_id":self.session_id,"agent_type":self.agent_type,"application_id":self.application_id,
+            "inputs_validated":inputs_validated,"validation_duration_ms":ms,
+            "validated_at":datetime.now().isoformat()}})
+
+    async def _record_input_failed(self, missing_inputs: list[str], errors: list[str]):
+        await self._append_session({"event_type":"AgentInputValidationFailed","event_version":1,"payload":{
+            "session_id":self.session_id,"agent_type":self.agent_type,"application_id":self.application_id,
+            "missing_inputs":missing_inputs,"validation_errors":errors,
+            "failed_at":datetime.now().isoformat()}})
+
     async def _record_output_written(self, events_written, summary):
         await self._append_session({"event_type":"AgentOutputWritten","event_version":1,"payload":{
             "session_id":self.session_id,"agent_type":self.agent_type,"application_id":self.application_id,

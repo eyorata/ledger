@@ -3,6 +3,7 @@ asyncpg>=0.29.0,<0.30
 anthropic>=0.30.0,<0.40
 pydantic>=2.6.0,<3.0
 langgraph>=0.1.0,<0.3
+requests>=2.31.0,<3.0
 
 # Data generation
 faker>=24.0.0,<26.0
