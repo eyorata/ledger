@@ -50,6 +50,13 @@ from ledger.schema.events import (
 from ledger.agents.stub_agents import REGULATIONS
 
 try:
+    from src.mcp.tools import register_tools
+    from src.mcp.resources import register_resources
+except Exception:  # pragma: no cover - optional dependency
+    register_tools = None
+    register_resources = None
+
+try:
     from fastmcp import FastMCP
 except Exception:  # pragma: no cover - optional dependency
     FastMCP = None
@@ -60,6 +67,7 @@ DB_URL = os.getenv("DATABASE_URL", "postgresql://localhost/apex_ledger")
 _store: EventStore | None = None
 _store_lock = asyncio.Lock()
 _last_integrity_check: dict[str, datetime] = {}
+_projection_daemon = None
 
 
 class PreconditionFailed(Exception):
@@ -80,6 +88,11 @@ async def _get_store() -> EventStore:
         _store = EventStore(DB_URL)
         await _store.connect()
         return _store
+
+
+def set_projection_daemon(daemon) -> None:
+    global _projection_daemon
+    _projection_daemon = daemon
 
 
 async def _ensure_agent_session(store: EventStore, agent_type: str, session_id: str, agent_id: str) -> None:
@@ -824,6 +837,8 @@ async def resource_agent_session(agent_id: str, session_id: str, store: EventSto
 
 
 async def resource_health(store: EventStore) -> dict[str, float | None]:
+    if _projection_daemon is not None:
+        return _projection_daemon.get_projection_lag()
     latest_pos, latest_at = await store.latest_event_info()
     async with store._pool.acquire() as conn:
         rows = await conn.fetch("SELECT projection_name, last_position, updated_at FROM projection_checkpoints")
@@ -847,117 +862,11 @@ def create_mcp_server() -> Any:
         raise RuntimeError("fastmcp is not installed. Add fastmcp to your environment.")
 
     mcp = FastMCP("ledger-mcp")
-
-    @mcp.tool(
-        name="submit_application",
-        description="Submit a new loan application. Validates schema and rejects duplicate application_id."
-    )
-    async def submit_application(**payload):
-        store = await _get_store()
-        return await tool_submit_application(payload, store)
-
-    @mcp.tool(
-        name="start_agent_session",
-        description=(
-            "Start an agent session and load context. "
-            "Precondition: must be called before any agent decision tools."
-        ),
-    )
-    async def start_agent_session(**payload):
-        store = await _get_store()
-        return await tool_start_agent_session(payload, store)
-
-    @mcp.tool(
-        name="record_credit_analysis",
-        description=(
-            "Record CreditAnalysisCompleted. "
-            "Precondition: active agent session created by start_agent_session. "
-            "If CreditAnalysisRequested is missing, this tool will append it."
-        ),
-    )
-    async def record_credit_analysis(**payload):
-        store = await _get_store()
-        return await tool_record_credit_analysis(payload, store)
-
-    @mcp.tool(
-        name="record_fraud_screening",
-        description=(
-            "Record FraudScreeningCompleted. "
-            "Precondition: active agent session created by start_agent_session."
-        ),
-    )
-    async def record_fraud_screening(**payload):
-        store = await _get_store()
-        return await tool_record_fraud_screening(payload, store)
-
-    @mcp.tool(
-        name="record_compliance_check",
-        description=(
-            "Record a compliance rule pass/fail. "
-            "Precondition: active agent session created by start_agent_session."
-        ),
-    )
-    async def record_compliance_check(**payload):
-        store = await _get_store()
-        return await tool_record_compliance_check(payload, store)
-
-    @mcp.tool(
-        name="generate_decision",
-        description=(
-            "Generate DecisionGenerated. Requires all analyses (credit, fraud, compliance) present. "
-            "If ComplianceCheckCompleted or DecisionRequested is missing, this tool will append them."
-        ),
-    )
-    async def generate_decision(**payload):
-        store = await _get_store()
-        return await tool_generate_decision(payload, store)
-
-    @mcp.tool(
-        name="record_human_review",
-        description="Record HumanReviewCompleted and finalize application state."
-    )
-    async def record_human_review(**payload):
-        store = await _get_store()
-        return await tool_record_human_review(payload, store)
-
-    @mcp.tool(
-        name="run_integrity_check",
-        description="Run audit integrity check. Precondition: compliance role only, 1/min per entity."
-    )
-    async def run_integrity(**payload):
-        store = await _get_store()
-        return await tool_run_integrity_check(payload, store)
-
-    @mcp.resource("ledger://applications/{application_id}")
-    async def application_summary(application_id: str):
-        store = await _get_store()
-        return await resource_application_summary(application_id, store)
-
-    @mcp.resource("ledger://applications/{application_id}/compliance")
-    async def compliance_view(application_id: str, as_of: str | None = None):
-        store = await _get_store()
-        return await resource_compliance(application_id, as_of, store)
-
-    @mcp.resource("ledger://applications/{application_id}/audit-trail")
-    async def audit_trail(application_id: str, from_ts: str | None = None, to_ts: str | None = None):
-        store = await _get_store()
-        return await resource_audit_trail(application_id, from_ts, to_ts, store)
-
-    @mcp.resource("ledger://agents/{agent_id}/performance")
-    async def agent_performance(agent_id: str):
-        store = await _get_store()
-        return await resource_agent_performance(agent_id, store)
-
-    @mcp.resource("ledger://agents/{agent_id}/sessions/{session_id}")
-    async def agent_sessions(agent_id: str, session_id: str):
-        store = await _get_store()
-        return await resource_agent_session(agent_id, session_id, store)
-
-    @mcp.resource("ledger://ledger/health")
-    async def ledger_health():
-        store = await _get_store()
-        return await resource_health(store)
-
+    if register_tools and register_resources:
+        register_tools(mcp, _get_store)
+        register_resources(mcp, _get_store)
+    else:
+        raise RuntimeError("MCP tool/resource registration modules are unavailable.")
     return mcp
 
 
