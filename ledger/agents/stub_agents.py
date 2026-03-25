@@ -25,6 +25,7 @@ from uuid import uuid4
 from langgraph.graph import StateGraph, END
 
 from ledger.agents.base_agent import BaseApexAgent
+from ledger.agents.memory import reconstruct_agent_context
 from ledger.schema.events import (
     DocumentFormatValidated,
     DocumentFormatRejected,
@@ -48,6 +49,7 @@ from ledger.schema.events import (
     HumanReviewRequested,
     ApplicationApproved,
     ApplicationDeclined,
+    AgentSessionRecovered,
     FraudAnomaly,
     FraudAnomalyType,
     FinancialFacts,
@@ -747,18 +749,78 @@ class FraudDetectionAgent(BaseApexAgent):
     def build_graph(self):
         g = StateGraph(FraudState)
         g.add_node("validate_inputs",         self._node_validate_inputs)
-        g.add_node("load_document_facts",     self._node_load_facts)
+        g.add_node("load_facts",              self._node_load_facts)
         g.add_node("cross_reference_registry",self._node_cross_reference)
         g.add_node("analyze_fraud_patterns",  self._node_analyze)
         g.add_node("write_output",            self._node_write_output)
 
         g.set_entry_point("validate_inputs")
-        g.add_edge("validate_inputs",          "load_document_facts")
-        g.add_edge("load_document_facts",      "cross_reference_registry")
+        g.add_conditional_edges(
+            "validate_inputs",
+            lambda s: "cross_reference_registry" if s.get("skip_load_facts") else "load_facts",
+        )
+        g.add_edge("load_facts",               "cross_reference_registry")
         g.add_edge("cross_reference_registry", "analyze_fraud_patterns")
         g.add_edge("analyze_fraud_patterns",   "write_output")
         g.add_edge("write_output",             END)
         return g.compile()
+
+    def _simulate_crash_after_node(self, node_name: str) -> None:
+        self._crash_after_node = node_name
+        self._crash_triggered = False
+
+    async def reconstruct_agent_context(self, prior_session_id: str):
+        self._resume_from_session_id = prior_session_id
+        ctx = await reconstruct_agent_context(self.store, self.agent_id, prior_session_id)
+        self._resume_from_node = await self._get_last_successful_node(prior_session_id)
+        return ctx
+
+    async def _get_last_successful_node(self, prior_session_id: str) -> str | None:
+        stream_id = f"agent-{self.agent_type}-{prior_session_id}"
+        events = await self.store.load_stream(stream_id)
+        for e in reversed(events):
+            if e.get("event_type") == "AgentSessionFailed":
+                return e.get("payload", {}).get("last_successful_node")
+        return None
+
+    async def process_application(self, application_id: str) -> None:
+        if not self._graph: self._graph = self.build_graph()
+        self.application_id = application_id
+        self.session_id = f"sess-{self.agent_type[:3]}-{uuid4().hex[:8]}"
+        self._session_stream = f"agent-{self.agent_type}-{self.session_id}"
+        self._t0 = time.time(); self._seq = 0; self._llm_calls = 0; self._tokens = 0; self._cost = 0.0
+
+        context_source = "fresh"
+        context_tokens = 1000
+        if getattr(self, "_resume_from_session_id", None):
+            context_source = f"prior_session_replay:{self._resume_from_session_id}"
+            try:
+                ctx = await reconstruct_agent_context(self.store, self.agent_id, self._resume_from_session_id)
+                context_tokens = min(len(ctx.context_text) // 4, 8000)
+            except Exception:
+                context_tokens = 1000
+
+        await self._start_session(application_id, context_source=context_source, context_token_count=context_tokens)
+
+        if getattr(self, "_resume_from_session_id", None):
+            await self._append_session({
+                "event_type":"AgentSessionRecovered","event_version":1,"payload":{
+                    "session_id":self.session_id,
+                    "agent_type":self.agent_type,
+                    "application_id":self.application_id,
+                    "recovered_from_session_id":self._resume_from_session_id,
+                    "recovery_point":self._resume_from_node or "unknown",
+                    "recovered_at":datetime.now().isoformat()
+                }
+            })
+
+        try:
+            result = await self._graph.ainvoke(self._initial_state(application_id))
+            await self._complete_session(result)
+        except Exception as e:
+            if not getattr(e, "_session_already_failed", False):
+                await self._fail_session(type(e).__name__, str(e))
+            raise
 
     def _initial_state(self, application_id: str) -> FraudState:
         return FraudState(
@@ -798,11 +860,14 @@ class FraudDetectionAgent(BaseApexAgent):
 
         await self._record_input_validated(["application_id","applicant_id"], ms)
         await self._record_node_execution("validate_inputs", ["application_id"], ["applicant_id"], ms)
+        resume_from = getattr(self, "_resume_from_node", None)
+        skip_load = resume_from == "load_facts"
+        if skip_load:
+            facts = await self._load_facts_from_docpkg(app_id)
+            return {**state, "applicant_id": applicant_id, "extracted_facts": facts, "skip_load_facts": True}
         return {**state, "applicant_id": applicant_id}
 
-    async def _node_load_facts(self, state):
-        t = time.time()
-        app_id = state["application_id"]
+    async def _load_facts_from_docpkg(self, app_id: str) -> dict:
         events = await self.store.load_stream(f"docpkg-{app_id}")
         facts = {}
         for e in events:
@@ -813,9 +878,26 @@ class FraudDetectionAgent(BaseApexAgent):
             for k, v in f.items():
                 if v is not None and k not in facts:
                     facts[k] = v
+        return facts
+
+    async def _node_load_facts(self, state):
+        t = time.time()
+        app_id = state["application_id"]
+        if state.get("skip_load_facts"):
+            return state
+        facts = await self._load_facts_from_docpkg(app_id)
         ms = int((time.time()-t)*1000)
         await self._record_tool_call("load_event_store_stream", f"docpkg-{app_id}", "ExtractionCompleted loaded", ms)
-        await self._record_node_execution("load_document_facts", ["application_id"], ["extracted_facts"], ms)
+        await self._record_node_execution("load_facts", ["application_id"], ["extracted_facts"], ms)
+
+        if getattr(self, "_crash_after_node", None) == "load_facts" and not getattr(self, "_crash_triggered", False):
+            self._crash_triggered = True
+            await self._fail_session("SimulatedCrash", "Simulated crash after load_facts",
+                                     last_successful_node="load_facts", recoverable=True)
+            err = Exception("SimulatedCrash")
+            setattr(err, "_session_already_failed", True)
+            raise err
+
         return {**state, "extracted_facts": facts}
 
     async def _node_cross_reference(self, state):

@@ -113,3 +113,10 @@ class ApplicationSummaryProjection(Projection):
                 human_reviewer_id,
                 final_decision_at,
             )
+
+    async def rebuild_from_scratch(self, store) -> None:
+        # Simple rebuild: truncate then reapply all events
+        async with store._pool.acquire() as conn:
+            await conn.execute("TRUNCATE application_summary")
+        async for event in store.load_all(from_global_position=0, event_types=list(self.subscribed_event_types)):
+            await self.handle(event, store)

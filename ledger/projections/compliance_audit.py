@@ -142,6 +142,8 @@ class ComplianceAuditViewProjection(Projection):
             )
             if row:
                 state = row["state"]
+                if isinstance(state, str):
+                    state = __import__("json").loads(state)
             else:
                 state = {"rules": [], "overall_verdict": None, "regulation_set_version": None}
 

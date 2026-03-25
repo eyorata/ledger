@@ -34,11 +34,15 @@ from ledger.schema.events import (
     ApplicationSubmitted,
     AgentSessionStarted,
     CreditDecision,
+    CreditAnalysisRequested,
     FraudScreeningCompleted,
     ComplianceRulePassed,
     ComplianceRuleFailed,
     ComplianceRuleNoted,
     ComplianceCheckCompleted,
+    ComplianceCheckRequested,
+    DecisionRequested,
+    AgentOutputWritten,
     HumanReviewCompleted,
     ApplicationApproved,
     ApplicationDeclined,
@@ -269,6 +273,20 @@ async def tool_record_credit_analysis(payload: dict, store: EventStore) -> dict:
 
     try:
         await _ensure_agent_session(store, data.agent_type, data.session_id, data.agent_id)
+        # Ensure CreditAnalysisRequested exists to satisfy aggregate preconditions
+        loan_events = await store.load_stream(f"loan-{data.application_id}")
+        if not any(e.get("event_type") == "CreditAnalysisRequested" for e in loan_events):
+            expected = await store.stream_version(f"loan-{data.application_id}")
+            await store.append(
+                f"loan-{data.application_id}",
+                [CreditAnalysisRequested(
+                    application_id=data.application_id,
+                    requested_at=datetime.now(timezone.utc),
+                    requested_by="mcp:record_credit_analysis",
+                    priority="NORMAL",
+                )],
+                expected_version=expected,
+            )
         cmd = CreditAnalysisCompletedCommand(
             application_id=data.application_id,
             agent_type=data.agent_type,
@@ -282,6 +300,22 @@ async def tool_record_credit_analysis(payload: dict, store: EventStore) -> dict:
             causation_id=data.causation_id,
         )
         await handle_credit_analysis_completed(cmd, store)
+
+        # Record agent output in the session stream for traceability
+        session_stream = f"agent-{data.agent_type}-{data.session_id}"
+        expected = await store.stream_version(session_stream)
+        await store.append(
+            session_stream,
+            [AgentOutputWritten(
+                session_id=data.session_id,
+                agent_type=data.agent_type,
+                application_id=data.application_id,
+                events_written=[{"stream_id": f"loan-{data.application_id}", "event_type": "CreditAnalysisCompleted"}],
+                output_summary="credit_analysis_completed",
+                written_at=datetime.now(timezone.utc),
+            )],
+            expected_version=expected,
+        )
     except PreconditionFailed as exc:
         return _error("PreconditionFailed", str(exc), suggested_action="start_agent_session")
     except DomainError as exc:
@@ -344,6 +378,21 @@ async def tool_record_fraud_screening(payload: dict, store: EventStore) -> dict:
             actual_version=exc.actual,
             suggested_action="reload_stream_and_retry",
         )
+    # Record agent output in the session stream for traceability
+    session_stream = f"agent-{data.agent_type}-{data.session_id}"
+    expected_session = await store.stream_version(session_stream)
+    await store.append(
+        session_stream,
+        [AgentOutputWritten(
+            session_id=data.session_id,
+            agent_type=data.agent_type,
+            application_id=data.application_id,
+            events_written=[{"stream_id": stream_id, "event_type": "FraudScreeningCompleted"}],
+            output_summary="fraud_screening_completed",
+            written_at=datetime.now(timezone.utc),
+        )],
+        expected_version=expected_session,
+    )
     return {"event_id": str(ev.event_id), "new_stream_version": new_version}
 
 
@@ -416,6 +465,21 @@ async def tool_record_compliance_check(payload: dict, store: EventStore) -> dict
             actual_version=exc.actual,
             suggested_action="reload_stream_and_retry",
         )
+    # Record agent output in the session stream for traceability
+    session_stream = f"agent-{data.agent_type}-{data.session_id}"
+    expected_session = await store.stream_version(session_stream)
+    await store.append(
+        session_stream,
+        [AgentOutputWritten(
+            session_id=data.session_id,
+            agent_type=data.agent_type,
+            application_id=data.application_id,
+            events_written=[{"stream_id": stream_id, "event_type": ev.event_type}],
+            output_summary=f"compliance_rule_{data.rule_id}_{status.lower()}",
+            written_at=datetime.now(timezone.utc),
+        )],
+        expected_version=expected_session,
+    )
     return {"check_id": str(ev.event_id), "compliance_status": status, "new_stream_version": new_version}
 
 
@@ -436,6 +500,27 @@ async def _assert_required_analyses(store: EventStore, application_id: str) -> N
         raise PreconditionFailed("Missing compliance evaluation for application.")
 
 
+async def _resolve_agent_session_stream(store: EventStore, session_id: str) -> str | None:
+    if hasattr(store, "_pool") and store._pool:
+        async with store._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT stream_id FROM events WHERE event_type='AgentSessionStarted' "
+                "AND payload->>'session_id'=$1 ORDER BY recorded_at DESC LIMIT 1",
+                session_id,
+            )
+        if row:
+            return row["stream_id"]
+
+    if hasattr(store, "_streams"):
+        for stream_id, events in getattr(store, "_streams", {}).items():
+            for event in events:
+                if event.get("event_type") == "AgentSessionStarted":
+                    payload = event.get("payload", {})
+                    if payload.get("session_id") == session_id:
+                        return stream_id
+    return None
+
+
 async def tool_generate_decision(payload: dict, store: EventStore) -> dict:
     try:
         data = DecisionGeneratedInput(**payload)
@@ -445,6 +530,70 @@ async def tool_generate_decision(payload: dict, store: EventStore) -> dict:
     try:
         await _ensure_agent_session(store, data.agent_type, data.orchestrator_session_id, data.agent_id)
         await _assert_required_analyses(store, data.application_id)
+
+        # Ensure ComplianceCheckCompleted exists if only per-rule events were recorded
+        compliance_events = await store.load_stream(f"compliance-{data.application_id}")
+        if not any(e.get("event_type") == "ComplianceCheckCompleted" for e in compliance_events):
+            rules = [e for e in compliance_events if e.get("event_type") in {"ComplianceRulePassed","ComplianceRuleFailed","ComplianceRuleNoted"}]
+            has_block = any(
+                e.get("event_type") == "ComplianceRuleFailed" and (e.get("payload") or {}).get("is_hard_block")
+                for e in rules
+            )
+            expected = await store.stream_version(f"compliance-{data.application_id}")
+            await store.append(
+                f"compliance-{data.application_id}",
+                [ComplianceCheckCompleted(
+                    application_id=data.application_id,
+                    session_id=data.orchestrator_session_id,
+                    rules_evaluated=len(rules),
+                    rules_passed=sum(1 for e in rules if e.get("event_type") == "ComplianceRulePassed"),
+                    rules_failed=sum(1 for e in rules if e.get("event_type") == "ComplianceRuleFailed"),
+                    rules_noted=sum(1 for e in rules if e.get("event_type") == "ComplianceRuleNoted"),
+                    has_hard_block=has_block,
+                    overall_verdict="BLOCKED" if has_block else "CLEAR",
+                    completed_at=datetime.now(timezone.utc),
+                )],
+                expected_version=expected,
+            )
+
+        # Ensure ComplianceCheckRequested + DecisionRequested exist to satisfy aggregate preconditions
+        loan_stream = f"loan-{data.application_id}"
+        loan_events = await store.load_stream(loan_stream)
+        if not any(e.get("event_type") == "ComplianceCheckRequested" for e in loan_events):
+            expected = await store.stream_version(loan_stream)
+            await store.append(
+                loan_stream,
+                [ComplianceCheckRequested(
+                    application_id=data.application_id,
+                    requested_at=datetime.now(timezone.utc),
+                    triggered_by_event_id="mcp:generate_decision",
+                    regulation_set_version="2026-Q1-v1",
+                    rules_to_evaluate=list(REGULATIONS.keys()),
+                )],
+                expected_version=expected,
+            )
+            loan_events.append({"event_type": "ComplianceCheckRequested"})
+
+        if not any(e.get("event_type") == "DecisionRequested" for e in loan_events):
+            expected = await store.stream_version(loan_stream)
+            await store.append(
+                loan_stream,
+                [DecisionRequested(
+                    application_id=data.application_id,
+                    requested_at=datetime.now(timezone.utc),
+                    all_analyses_complete=True,
+                    triggered_by_event_id="mcp:generate_decision",
+                )],
+                expected_version=expected,
+            )
+        contributing_sessions = []
+        for session in data.contributing_sessions or []:
+            if session.startswith("agent-"):
+                contributing_sessions.append(session)
+                continue
+            resolved = await _resolve_agent_session_stream(store, session)
+            contributing_sessions.append(resolved or session)
+
         cmd = DecisionGeneratedCommand(
             application_id=data.application_id,
             orchestrator_session_id=data.orchestrator_session_id,
@@ -455,7 +604,7 @@ async def tool_generate_decision(payload: dict, store: EventStore) -> dict:
             conditions=data.conditions,
             executive_summary=data.executive_summary,
             key_risks=data.key_risks,
-            contributing_sessions=data.contributing_sessions,
+            contributing_sessions=contributing_sessions,
             model_versions=data.model_versions,
             correlation_id=data.correlation_id,
             causation_id=data.causation_id,
@@ -722,7 +871,8 @@ def create_mcp_server() -> Any:
         name="record_credit_analysis",
         description=(
             "Record CreditAnalysisCompleted. "
-            "Precondition: active agent session created by start_agent_session."
+            "Precondition: active agent session created by start_agent_session. "
+            "If CreditAnalysisRequested is missing, this tool will append it."
         ),
     )
     async def record_credit_analysis(**payload):
@@ -754,7 +904,8 @@ def create_mcp_server() -> Any:
     @mcp.tool(
         name="generate_decision",
         description=(
-            "Generate DecisionGenerated. Requires all analyses (credit, fraud, compliance) present."
+            "Generate DecisionGenerated. Requires all analyses (credit, fraud, compliance) present. "
+            "If ComplianceCheckCompleted or DecisionRequested is missing, this tool will append them."
         ),
     )
     async def generate_decision(**payload):

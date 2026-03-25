@@ -189,3 +189,12 @@ class AgentPerformanceLedgerProjection(Projection):
                 agent_id,
                 model_version,
             )
+
+    async def rebuild_from_scratch(self, store) -> None:
+        # Reset projection state and reapply all events
+        self._session_map.clear()
+        self._decision_map.clear()
+        async with store._pool.acquire() as conn:
+            await conn.execute("TRUNCATE agent_performance_ledger")
+        async for event in store.load_all(from_global_position=0, event_types=list(self.subscribed_event_types)):
+            await self.handle(event, store)

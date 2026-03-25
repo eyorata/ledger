@@ -50,17 +50,19 @@ class BaseApexAgent(ABC):
             result = await self._graph.ainvoke(self._initial_state(application_id))
             await self._complete_session(result)
         except Exception as e:
-            await self._fail_session(type(e).__name__, str(e)); raise
+            if not getattr(e, "_session_already_failed", False):
+                await self._fail_session(type(e).__name__, str(e))
+            raise
 
     def _initial_state(self, app_id):
         return {"application_id": app_id, "session_id": self.session_id,
                 "agent_id": self.agent_id, "errors": [], "output_events_written": [], "next_agent_triggered": None}
 
-    async def _start_session(self, app_id):
+    async def _start_session(self, app_id, context_source: str = "fresh", context_token_count: int = 1000):
         await self._append_session({"event_type":"AgentSessionStarted","event_version":1,"payload":{
             "session_id":self.session_id,"agent_type":self.agent_type,"agent_id":self.agent_id,
             "application_id":app_id,"model_version":self.model,"langgraph_graph_version":LANGGRAPH_VERSION,
-            "context_source":"fresh","context_token_count":1000,"started_at":datetime.now().isoformat()}})
+            "context_source":context_source,"context_token_count":context_token_count,"started_at":datetime.now().isoformat()}})
 
     async def _record_node_execution(self, name, in_keys, out_keys, ms, tok_in=None, tok_out=None, cost=None):
         self._seq += 1
@@ -103,11 +105,13 @@ class BaseApexAgent(ABC):
             "total_cost_usd":round(self._cost,6),"total_duration_ms":ms,
             "next_agent_triggered":result.get("next_agent_triggered"),"completed_at":datetime.now().isoformat()}})
 
-    async def _fail_session(self, etype, emsg):
+    async def _fail_session(self, etype, emsg, last_successful_node: str | None = None, recoverable: bool | None = None):
         await self._append_session({"event_type":"AgentSessionFailed","event_version":1,"payload":{
             "session_id":self.session_id,"agent_type":self.agent_type,"application_id":self.application_id,
-            "error_type":etype,"error_message":emsg[:500],"last_successful_node":f"node_{self._seq}",
-            "recoverable":etype in ("llm_timeout","RateLimitError"),"failed_at":datetime.now().isoformat()}})
+            "error_type":etype,"error_message":emsg[:500],
+            "last_successful_node":last_successful_node or f"node_{self._seq}",
+            "recoverable": recoverable if recoverable is not None else etype in ("llm_timeout","RateLimitError"),
+            "failed_at":datetime.now().isoformat()}})
 
     async def _append_session(self, event: dict):
         """Append agent session events to the agent stream with OCC retry."""

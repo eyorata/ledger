@@ -406,6 +406,7 @@ Provide your analysis as JSON."""
         req      = state.get("requested_amount_usd") or 0
         flags    = state.get("compliance_flags") or []
         loans    = state.get("loan_history") or []
+        q_flags  = state.get("quality_flags") or []
         viols:  list[str] = []
 
         # Policy 1: loan-to-revenue cap
@@ -427,6 +428,17 @@ Provide your analysis as JSON."""
             if d.get("confidence", 0) > 0.50:
                 d["confidence"] = 0.50
                 viols.append("POLICY_COMPLIANCE_FLAG: confidence capped at 0.50")
+
+        # NARR-02: missing EBITDA or critical fields -> cap confidence and add caveats
+        has_ebitda_missing = any("ebitda" in str(f).lower() for f in q_flags)
+        if has_ebitda_missing:
+            if d.get("confidence", 1.0) > 0.75:
+                d["confidence"] = 0.75
+                viols.append("POLICY_DATA_QUALITY: confidence capped at 0.75 due to missing EBITDA")
+            caveats = d.get("data_quality_caveats") or []
+            if not caveats:
+                caveats = ["EBITDA missing in extracted documents; confidence capped at 0.75"]
+            d["data_quality_caveats"] = caveats
 
         if viols:
             d["policy_overrides_applied"] = d.get("policy_overrides_applied", []) + viols
