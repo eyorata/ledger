@@ -262,3 +262,44 @@ async def test_daemon_retries_then_skips(store):
 
     cp = await store.load_checkpoint("flaky")
     assert cp >= 1
+
+
+@pytest.mark.asyncio
+async def test_rebuild_from_scratch_completes(store):
+    app_proj = ApplicationSummaryProjection()
+    comp_proj = ComplianceAuditViewProjection()
+
+    app_id = "APP-REBUILD"
+    await store.append(
+        f"loan-{app_id}",
+        _loan_events(app_id),
+        expected_version=-1,
+    )
+    await store.append(
+        f"compliance-{app_id}",
+        [
+            {"event_type": "ComplianceCheckInitiated", "event_version": 1,
+             "payload": {"application_id": app_id, "regulation_set_version": "2026-Q1", "rules_to_evaluate": ["REG-001"]}},
+            {"event_type": "ComplianceRulePassed", "event_version": 1,
+             "payload": {"application_id": app_id, "rule_id": "REG-001", "rule_name": "KYC", "rule_version": "v1",
+                         "evaluated_at": datetime.now(timezone.utc).isoformat()}},
+            {"event_type": "ComplianceCheckCompleted", "event_version": 1,
+             "payload": {"application_id": app_id, "overall_verdict": "CLEAR"}},
+        ],
+        expected_version=-1,
+    )
+
+    await app_proj.rebuild_from_scratch(store)
+    await comp_proj.rebuild_from_scratch(store)
+
+    async with store._pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM application_summary WHERE application_id=$1",
+            app_id,
+        )
+        assert row is not None
+        row2 = await conn.fetchrow(
+            "SELECT application_id, state FROM compliance_audit_current WHERE application_id=$1",
+            app_id,
+        )
+        assert row2 is not None
