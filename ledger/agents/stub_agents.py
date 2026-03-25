@@ -1432,7 +1432,21 @@ class DecisionOrchestratorAgent(BaseApexAgent):
 
     async def _node_validate_inputs(self, state):
         t = time.time()
-        await self._record_node_execution("validate_inputs", ["application_id"], ["application_id"], int((time.time()-t)*1000))
+        app_id = state["application_id"]
+        loan_events = await self.store.load_stream(f"loan-{app_id}")
+        has_request = any(e.get("event_type") == "DecisionRequested" for e in loan_events)
+        errors = []
+        if not has_request:
+            errors.append("Missing DecisionRequested on loan stream")
+
+        ms = int((time.time()-t)*1000)
+        if errors:
+            await self._record_input_failed([], errors)
+            await self._record_node_execution("validate_inputs", ["application_id"], ["errors"], ms)
+            raise ValueError(f"Input validation failed: {errors}")
+
+        await self._record_input_validated(["application_id"], ms)
+        await self._record_node_execution("validate_inputs", ["application_id"], ["application_id"], ms)
         return state
 
     async def _node_load_credit(self, state):
@@ -1483,26 +1497,41 @@ class DecisionOrchestratorAgent(BaseApexAgent):
         fraud = state.get("fraud_result") or {}
         compliance = state.get("compliance_result") or {}
 
-        risk_tier = (credit.get("decision") or {}).get("risk_tier")
+        SYSTEM = """You are a senior loan officer synthesising multi-agent analysis.
+Produce a recommendation (APPROVE/DECLINE/REFER),
+approved_amount_usd, executive_summary (3-5 sentences),
+and key_risks list. Return OrchestratorDecision JSON."""
+
+        USER = json.dumps(
+            {
+                "credit": credit,
+                "fraud": fraud,
+                "compliance": compliance,
+            },
+            indent=2,
+            default=str,
+        )
+
+        recommendation = "REFER"
         confidence = (credit.get("decision") or {}).get("confidence") or 0.7
         approved_amount = (credit.get("decision") or {}).get("recommended_limit_usd")
-        fraud_score = fraud.get("fraud_score") or 0.0
-        compliance_verdict = compliance.get("overall_verdict") or "CLEAR"
-
-        recommendation = "APPROVE"
-        if compliance_verdict == "BLOCKED":
-            recommendation = "DECLINE"
-        elif risk_tier == "HIGH" or fraud_score > 0.60:
-            recommendation = "REFER"
-
-        summary = (
-            f"Credit risk tier {risk_tier}, confidence {confidence:.2f}. "
-            f"Fraud score {fraud_score:.2f}. Compliance verdict {compliance_verdict}."
-        )
+        summary = ""
+        key_risks = []
+        ti = to = 0
+        cost = 0.0
+        try:
+            content, ti, to, cost = await self._call_llm(SYSTEM, USER, max_tokens=512)
+            data = _parse_json(content) or {}
+            recommendation = data.get("recommendation", recommendation)
+            approved_amount = data.get("approved_amount_usd", approved_amount)
+            summary = data.get("executive_summary", summary)
+            key_risks = data.get("key_risks", []) or []
+        except Exception:
+            summary = "Automated synthesis failed; defaulting to REFER."
 
         ms = int((time.time()-t)*1000)
         await self._record_node_execution("synthesize_decision", ["credit_result","fraud_result","compliance_result"],
-                                          ["recommendation","executive_summary","approved_amount"], ms)
+                                          ["recommendation","executive_summary","approved_amount"], ms, ti, to, cost)
         return {
             **state,
             "recommendation": recommendation,
@@ -1510,6 +1539,8 @@ class DecisionOrchestratorAgent(BaseApexAgent):
             "approved_amount": approved_amount,
             "executive_summary": summary,
             "conditions": [],
+            "hard_constraints_applied": [],
+            "key_risks": key_risks,
         }
 
     async def _node_constraints(self, state):
@@ -1559,9 +1590,9 @@ class DecisionOrchestratorAgent(BaseApexAgent):
             approved_amount_usd=approved_amount,
             conditions=state.get("conditions") or [],
             executive_summary=summary,
-            key_risks=key_risks,
-            contributing_sessions=[],
-            model_versions={},
+            key_risks=state.get("key_risks") or [],
+            contributing_sessions=state.get("contributing_sessions") or [],
+            model_versions=state.get("model_versions") or {},
             generated_at=datetime.now().isoformat(),
         )
         await self._append_stream(f"loan-{app_id}", decision_event.to_store_dict())
