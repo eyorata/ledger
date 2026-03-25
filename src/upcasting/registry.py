@@ -1,7 +1,7 @@
 """
 src/upcasting/registry.py
-Wrapper for UpcasterRegistry.
+Thin wrapper for spec path compatibility.
 """
-from ledger.upcasters import UpcasterRegistry, build_default_registry
+from ledger.upcasters import UpcasterRegistry  # noqa: F401
 
-__all__ = ["UpcasterRegistry", "build_default_registry"]
+__all__ = ["UpcasterRegistry"]

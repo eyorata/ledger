@@ -1,7 +1,7 @@
 """
 src/upcasting/upcasters.py
-Registered upcasters are in ledger.upcasters; this module re-exports helpers.
+Thin wrapper for spec path compatibility.
 """
-from ledger.upcasters import UpcasterRegistry, build_default_registry
+from ledger.upcasters import build_default_registry  # noqa: F401
 
-__all__ = ["UpcasterRegistry", "build_default_registry"]
+__all__ = ["build_default_registry"]

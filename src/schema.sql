@@ -1,3 +1,7 @@
+-- Thin wrapper include for schema
+-- This file mirrors the root schema.sql for spec path compatibility.
+-- Keep in sync with ../../schema.sql
+-- (Use root schema.sql as source of truth.)
 -- Event store schema (Phase 1)
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 

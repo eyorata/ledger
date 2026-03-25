@@ -1,7 +1,5 @@
 """
 src/aggregates/compliance_record.py
-Wrapper for ComplianceRecordAggregate.
+Thin wrapper for spec path compatibility.
 """
-from ledger.domain.aggregates.compliance_record import ComplianceRecordAggregate
-
-__all__ = ["ComplianceRecordAggregate"]
+from ledger.domain.aggregates.compliance_record import *  # noqa: F401,F403

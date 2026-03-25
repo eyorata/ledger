@@ -1,7 +1,5 @@
 """
 src/event_store.py
-Wrapper to match Phase 1 checklist structure.
+Thin wrapper for spec path compatibility.
 """
-from ledger.event_store import EventStore, InMemoryEventStore, OptimisticConcurrencyError
-
-__all__ = ["EventStore", "InMemoryEventStore", "OptimisticConcurrencyError"]
+from ledger.event_store import *  # noqa: F401,F403

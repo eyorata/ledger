@@ -1,7 +1,5 @@
 """
 src/projections/compliance_audit.py
-Wrapper for ComplianceAuditView projection.
+Thin wrapper for spec path compatibility.
 """
-from ledger.projections.compliance_audit import ComplianceAuditViewProjection
-
-__all__ = ["ComplianceAuditViewProjection"]
+from ledger.projections.compliance_audit import *  # noqa: F401,F403

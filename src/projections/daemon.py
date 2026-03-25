@@ -1,7 +1,5 @@
 """
 src/projections/daemon.py
-Wrapper for ProjectionDaemon.
+Thin wrapper for spec path compatibility.
 """
-from ledger.projections.daemon import ProjectionDaemon
-
-__all__ = ["ProjectionDaemon"]
+from ledger.projections.daemon import *  # noqa: F401,F403
