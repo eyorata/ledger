@@ -54,7 +54,7 @@ class AgentSessionAggregate:
         self.context_loaded = True
 
     def assert_context_loaded(self) -> None:
-        if not self.context_loaded or self.first_event_type not in ("AgentSessionStarted", "AgentContextLoaded"):
+        if not self.context_loaded or self.first_event_type != "AgentContextLoaded":
             raise DomainError("Agent context must be loaded as the first event")
 
     def assert_model_version_current(self, model_version: str) -> None:

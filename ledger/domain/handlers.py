@@ -22,7 +22,7 @@ from ledger.schema.events import (
     ComplianceRuleNoted,
     DecisionGenerated,
     HumanReviewCompleted,
-    AgentSessionStarted,
+    AgentContextLoaded,
     ApplicationApproved,
 )
 
@@ -237,7 +237,7 @@ async def handle_start_agent_session(
     cmd: StartAgentSessionCommand,
     store,
 ) -> None:
-    new_event = AgentSessionStarted(
+    new_event = AgentContextLoaded(
         session_id=cmd.session_id,
         agent_type=cmd.agent_type,
         agent_id=cmd.agent_id,
@@ -246,7 +246,7 @@ async def handle_start_agent_session(
         langgraph_graph_version=cmd.langgraph_graph_version,
         context_source=cmd.context_source,
         context_token_count=cmd.context_token_count,
-        started_at=datetime.now(timezone.utc),
+        loaded_at=datetime.now(timezone.utc),
     )
     stream_id = f"agent-{cmd.agent_type}-{cmd.session_id}"
     expected = await store.stream_version(stream_id)

@@ -32,7 +32,7 @@ from ledger.domain.handlers import (
 from ledger.event_store import EventStore, OptimisticConcurrencyError
 from ledger.schema.events import (
     ApplicationSubmitted,
-    AgentSessionStarted,
+    AgentContextLoaded,
     CreditDecision,
     CreditAnalysisRequested,
     FraudScreeningCompleted,
@@ -249,7 +249,7 @@ async def tool_start_agent_session(payload: dict, store: EventStore) -> dict:
     if await store.stream_version(stream_id) >= 0:
         return _error("DuplicateSession", "session_id already exists.", stream_id=stream_id)
 
-    ev = AgentSessionStarted(
+    ev = AgentContextLoaded(
         session_id=session_id,
         agent_type=data.agent_type,
         agent_id=data.agent_id,
@@ -258,7 +258,7 @@ async def tool_start_agent_session(payload: dict, store: EventStore) -> dict:
         langgraph_graph_version=data.langgraph_graph_version,
         context_source=data.context_source,
         context_token_count=data.context_token_count,
-        started_at=datetime.now(timezone.utc),
+        loaded_at=datetime.now(timezone.utc),
     )
     new_version = await store.append(stream_id, [ev], expected_version=-1)
     return {"session_id": session_id, "context_position": new_version}
@@ -504,7 +504,7 @@ async def _resolve_agent_session_stream(store: EventStore, session_id: str) -> s
     if hasattr(store, "_pool") and store._pool:
         async with store._pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT stream_id FROM events WHERE event_type='AgentSessionStarted' "
+                "SELECT stream_id FROM events WHERE event_type IN ('AgentContextLoaded','AgentSessionStarted') "
                 "AND payload->>'session_id'=$1 ORDER BY recorded_at DESC LIMIT 1",
                 session_id,
             )
@@ -514,7 +514,7 @@ async def _resolve_agent_session_stream(store: EventStore, session_id: str) -> s
     if hasattr(store, "_streams"):
         for stream_id, events in getattr(store, "_streams", {}).items():
             for event in events:
-                if event.get("event_type") == "AgentSessionStarted":
+                if event.get("event_type") in ("AgentContextLoaded", "AgentSessionStarted"):
                     payload = event.get("payload", {})
                     if payload.get("session_id") == session_id:
                         return stream_id
@@ -809,10 +809,10 @@ async def resource_agent_performance(agent_id: str, store: EventStore) -> list[d
 
 
 async def resource_agent_session(agent_id: str, session_id: str, store: EventStore) -> list[dict] | None:
-    # Find stream id from AgentSessionStarted payload
+    # Find stream id from AgentContextLoaded payload
     async with store._pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT stream_id FROM events WHERE event_type='AgentSessionStarted' "
+            "SELECT stream_id FROM events WHERE event_type IN ('AgentContextLoaded','AgentSessionStarted') "
             "AND payload->>'agent_id'=$1 AND payload->>'session_id'=$2 "
             "ORDER BY recorded_at ASC LIMIT 1",
             agent_id,

@@ -24,7 +24,7 @@ async def _find_agent_stream(store, agent_id: str, session_id: str) -> str | Non
         async with store._pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT stream_id FROM events "
-                "WHERE event_type='AgentSessionStarted' "
+                "WHERE event_type IN ('AgentContextLoaded','AgentSessionStarted') "
                 "AND payload->>'agent_id'=$1 "
                 "AND payload->>'session_id'=$2 "
                 "ORDER BY recorded_at ASC LIMIT 1",
@@ -37,7 +37,7 @@ async def _find_agent_stream(store, agent_id: str, session_id: str) -> str | Non
     # In-memory fallback
     if hasattr(store, "_global"):
         for e in store._global:
-            if e.get("event_type") != "AgentSessionStarted":
+            if e.get("event_type") not in ("AgentContextLoaded", "AgentSessionStarted"):
                 continue
             payload = e.get("payload", {})
             if payload.get("agent_id") == agent_id and payload.get("session_id") == session_id:

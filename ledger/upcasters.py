@@ -47,7 +47,7 @@ class UpcasterRegistry:
             async with self._store._pool.acquire() as conn:
                 row = await conn.fetchrow(
                     "SELECT payload->>'model_version' AS model_version "
-                    "FROM events WHERE event_type='AgentSessionStarted' "
+                    "FROM events WHERE event_type IN ('AgentContextLoaded','AgentSessionStarted') "
                     "AND payload->>'session_id'=$1 LIMIT 1",
                     session_id,
                 )
@@ -56,7 +56,7 @@ class UpcasterRegistry:
         # In-memory store fallback
         if hasattr(self._store, "_global"):
             for e in self._store._global:
-                if e.get("event_type") == "AgentSessionStarted":
+                if e.get("event_type") in ("AgentContextLoaded", "AgentSessionStarted"):
                     p = e.get("payload", {})
                     if p.get("session_id") == session_id:
                         return p.get("model_version", "unknown")

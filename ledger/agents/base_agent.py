@@ -59,10 +59,10 @@ class BaseApexAgent(ABC):
                 "agent_id": self.agent_id, "errors": [], "output_events_written": [], "next_agent_triggered": None}
 
     async def _start_session(self, app_id, context_source: str = "fresh", context_token_count: int = 1000):
-        await self._append_session({"event_type":"AgentSessionStarted","event_version":1,"payload":{
+        await self._append_session({"event_type":"AgentContextLoaded","event_version":1,"payload":{
             "session_id":self.session_id,"agent_type":self.agent_type,"agent_id":self.agent_id,
             "application_id":app_id,"model_version":self.model,"langgraph_graph_version":LANGGRAPH_VERSION,
-            "context_source":context_source,"context_token_count":context_token_count,"started_at":datetime.now().isoformat()}})
+            "context_source":context_source,"context_token_count":context_token_count,"loaded_at":datetime.now().isoformat()}})
 
     async def _record_node_execution(self, name, in_keys, out_keys, ms, tok_in=None, tok_out=None, cost=None):
         self._seq += 1

@@ -8,7 +8,7 @@ from ledger.projections.base import Projection
 class AgentPerformanceLedgerProjection(Projection):
     name = "agent_performance_ledger"
     subscribed_event_types = {
-        "AgentSessionStarted",
+        "AgentContextLoaded",
         "AgentSessionCompleted",
         "DecisionGenerated",
         "HumanReviewCompleted",
@@ -23,14 +23,14 @@ class AgentPerformanceLedgerProjection(Projection):
         et = event.get("event_type")
         payload = event.get("payload", {})
 
-        if et == "AgentSessionStarted":
+        if et == "AgentContextLoaded":
             agent_id = payload.get("agent_id")
             model_version = payload.get("model_version")
             session_id = payload.get("session_id")
             if not (agent_id and model_version and session_id):
                 return
             self._session_map[session_id] = (agent_id, model_version)
-            await self._touch_row(store, agent_id, model_version, payload.get("started_at"))
+            await self._touch_row(store, agent_id, model_version, payload.get("loaded_at"))
             return
 
         if et == "AgentSessionCompleted":

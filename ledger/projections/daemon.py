@@ -1,17 +1,20 @@
 """Async projection daemon."""
 from __future__ import annotations
 import asyncio
+import logging
 from collections import defaultdict
 from datetime import datetime
 
+logger = logging.getLogger(__name__)
+
 
 class ProjectionDaemon:
-    def __init__(self, store, projections: list):
+    def __init__(self, store, projections: list, max_retries: int = 3):
         self._store = store
         self._projections = {p.name: p for p in projections}
         self._running = False
         self._retry_counts = defaultdict(int)
-        self._max_retries = 3
+        self._max_retries = max_retries
 
     async def run_forever(self, poll_interval_ms: int = 100) -> None:
         self._running = True
@@ -49,9 +52,16 @@ class ProjectionDaemon:
                     proj.last_processed_at = event.get("recorded_at")
                     await self._store.save_checkpoint(name, proj.last_processed_position)
                 except Exception:
+                    logger.exception(
+                        "Projection %s failed on event %s (gp=%s)",
+                        name,
+                        event.get("event_type"),
+                        event_gp,
+                    )
                     self._retry_counts[key] += 1
                     if self._retry_counts[key] >= self._max_retries:
                         proj.last_processed_position = event_gp
+                        proj.last_processed_at = event.get("recorded_at")
                         await self._store.save_checkpoint(name, proj.last_processed_position)
                         continue
                     continue
@@ -66,7 +76,10 @@ class ProjectionDaemon:
                 lag_ms = (latest_recorded_at - proj.last_processed_at).total_seconds() * 1000
                 proj.set_lag(max(lag_ms, 0.0))
             else:
-                proj.set_lag(None)
+                if latest_recorded_at and proj.last_processed_position >= 0:
+                    proj.set_lag(0.0)
+                else:
+                    proj.set_lag(None)
 
     def get_lag(self, projection_name: str) -> float | None:
         proj = self._projections.get(projection_name)
