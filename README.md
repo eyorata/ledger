@@ -10,18 +10,21 @@ docker run -d -e POSTGRES_PASSWORD=admin -e POSTGRES_DB=apex_ledger -p 5432:5432
 
 # 3. Set environment
 cp .env.example .env
-# Edit .env — add your ANTHROPIC_API_KEY
+# Edit .env — add your ANTHROPIC_API_KEY and DATABASE_URL if needed
 
-# 4. Generate all data (companies + documents + seed events → DB)
+# 4. Run migrations (schema)
+psql postgresql://postgres:admin@localhost/apex_ledger -f schema.sql
+
+# 5. Generate all data (companies + documents + seed events → DB)
 python datagen/generate_all.py --db-url postgresql://postgres:admin@localhost/apex_ledger
 
-# 5. Validate schema (no DB needed)
+# 6. Validate schema (no DB needed)
 python datagen/generate_all.py --skip-db --skip-docs --validate-only
 
-# 6. Run Phase 0 tests (must pass before starting Phase 1)
+# 7. Run Phase 0 tests (must pass before starting Phase 1)
 pytest tests/test_schema_and_generator.py -v
 
-# 7. Begin Phase 1: implement EventStore
+# 8. Begin Phase 1: implement EventStore
 # Edit: ledger/event_store.py
 # Test: pytest tests/test_event_store.py -v
 ```
@@ -52,8 +55,22 @@ pytest tests/test_schema_and_generator.py -v
 ```bash
 pytest tests/test_schema_and_generator.py -v  # Phase 0: all must pass before Phase 1
 pytest tests/test_event_store.py -v           # Phase 1
-pytest tests/test_domain.py -v               # Phase 2
+pytest tests/phase2/test_domain.py -v         # Phase 2
 pytest tests/test_narratives.py -v           # Phase 3: all 5 must pass
-pytest tests/test_projections.py -v          # Phase 4
-pytest tests/test_mcp.py -v                  # Phase 5
+pytest tests/phase3/test_projections.py -v    # Phase 4
+pytest tests/test_mcp_lifecycle.py -v         # Phase 5
+pytest tests/phase4 -v                        # Phase 4 extras (upcasting, integrity, memory)
+pytest tests/ -q                              # Full suite (skips DB tests if not configured)
+```
+
+## Migrations
+Use `schema.sql` as the source of truth.
+
+```bash
+psql postgresql://postgres:admin@localhost/apex_ledger -f schema.sql
+```
+
+## Full Test Suite
+```bash
+pytest tests/ -q
 ```
