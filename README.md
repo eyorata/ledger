@@ -74,3 +74,28 @@ psql postgresql://postgres:admin@localhost/apex_ledger -f schema.sql
 ```bash
 pytest tests/ -q
 ```
+
+## MCP Server
+Start the MCP server:
+
+```bash
+python -c "from src.mcp.server import create_mcp_server; create_mcp_server().run(host='0.0.0.0', port=8765)"
+```
+
+Example tool call via MCP (pseudo-usage):
+- `submit_application`
+- `start_agent_session`
+- `record_credit_analysis`
+- `record_fraud_screening`
+- `record_compliance_check`
+- `generate_decision`
+- `record_human_review`
+- `run_integrity_check`
+
+Example resource queries (read side):
+- `ledger://applications/{id}`
+- `ledger://applications/{id}/compliance`
+- `ledger://applications/{id}/audit-trail`
+- `ledger://agents/{id}/performance`
+- `ledger://agents/{id}/sessions/{session_id}`
+- `ledger://ledger/health`
