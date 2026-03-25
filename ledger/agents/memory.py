@@ -9,6 +9,8 @@ import json
 from dataclasses import dataclass
 from datetime import datetime
 
+from ledger.domain.aggregates.loan_application import LoanApplicationAggregate
+
 
 @dataclass
 class AgentContext:
@@ -104,10 +106,29 @@ async def reconstruct_agent_context(
     preserved = [events[i] for i in sorted(preserved_indices)]
     older = [e for i, e in enumerate(events) if i not in preserved_indices]
 
+    application_id = None
+    for e in events:
+        if e.get("event_type") in ("AgentContextLoaded", "AgentSessionStarted"):
+            application_id = (e.get("payload") or {}).get("application_id")
+            if application_id:
+                break
+
+    application_state = None
+    if application_id:
+        try:
+            app = await LoanApplicationAggregate.load(store, application_id)
+            application_state = app.state
+        except Exception:
+            application_state = None
+
     summary_lines = [
         f"Session stream: {stream_id}",
         f"Total events: {len(events)}",
     ]
+    if application_id:
+        summary_lines.append(f"Application: {application_id}")
+    if application_state:
+        summary_lines.append(f"Application state: {application_state}")
     if older:
         summary_lines.append("Earlier events summary: " + _summarize_event_counts(older))
 

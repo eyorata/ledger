@@ -13,7 +13,7 @@ async def test_reconstruct_agent_context_needs_reconciliation():
 
     events = [
         {
-            "event_type": "AgentSessionStarted",
+            "event_type": "AgentContextLoaded",
             "event_version": 1,
             "payload": {
                 "session_id": "S-CRASH-1",
@@ -24,7 +24,7 @@ async def test_reconstruct_agent_context_needs_reconciliation():
                 "langgraph_graph_version": "g1",
                 "context_source": "registry",
                 "context_token_count": 123,
-                "started_at": datetime.now(timezone.utc).isoformat(),
+                "loaded_at": datetime.now(timezone.utc).isoformat(),
             },
         },
         {

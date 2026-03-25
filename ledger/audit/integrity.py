@@ -21,9 +21,16 @@ class IntegrityCheckResult:
     tamper_detected: bool
 
 
-def _hash_payload(payload: dict) -> str:
-    data = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return sha256(data).hexdigest()
+def _hash_event(event: dict) -> str:
+    data = {
+        "event_type": event.get("event_type"),
+        "event_version": event.get("event_version"),
+        "payload": event.get("payload", {}),
+        "metadata": event.get("metadata", {}),
+        "recorded_at": event.get("recorded_at"),
+    }
+    encoded = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return sha256(encoded).hexdigest()
 
 
 def _chain_hash(previous_hash: str | None, event_hashes: Iterable[str]) -> str:
@@ -56,7 +63,7 @@ async def run_integrity_check(store, entity_type: str, entity_id: str) -> Integr
         payload = audit_event.get("payload", {})
         count = int(payload.get("events_verified_count", 0))
         segment = primary_events[cursor:cursor + count]
-        event_hashes = [_hash_payload(e.get("payload", {})) for e in segment]
+        event_hashes = [_hash_event(e) for e in segment]
         expected = payload.get("integrity_hash")
         computed = _chain_hash(previous_hash, event_hashes)
         if expected != computed:
@@ -67,7 +74,7 @@ async def run_integrity_check(store, entity_type: str, entity_id: str) -> Integr
 
     # Hash remaining events since last check
     remaining = primary_events[cursor:]
-    remaining_hashes = [_hash_payload(e.get("payload", {})) for e in remaining]
+    remaining_hashes = [_hash_event(e) for e in remaining]
     new_hash = _chain_hash(previous_hash, remaining_hashes)
 
     integrity_event = AuditIntegrityCheckRun(

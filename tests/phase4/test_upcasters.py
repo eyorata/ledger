@@ -3,8 +3,11 @@ import json
 from datetime import datetime, timezone
 
 import pytest
+from dotenv import load_dotenv
 
 from ledger.event_store import EventStore
+
+load_dotenv()
 
 
 DB_URL = os.getenv("DATABASE_URL", "postgresql://localhost/apex_ledger")
@@ -77,7 +80,7 @@ async def test_upcast_decision_generated_model_versions(store):
         agent_stream,
         [
             {
-                "event_type": "AgentSessionStarted",
+                "event_type": "AgentContextLoaded",
                 "event_version": 1,
                 "payload": {
                     "session_id": session_id,
@@ -88,7 +91,7 @@ async def test_upcast_decision_generated_model_versions(store):
                     "langgraph_graph_version": "g1",
                     "context_source": "registry",
                     "context_token_count": 123,
-                    "started_at": datetime.now(timezone.utc).isoformat(),
+                    "loaded_at": datetime.now(timezone.utc).isoformat(),
                 },
             }
         ],
