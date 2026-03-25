@@ -75,6 +75,8 @@ class PreconditionFailed(Exception):
 
 
 def _error(error_type: str, message: str, **kwargs: Any) -> dict:
+    if "suggested_action" not in kwargs:
+        kwargs["suggested_action"] = "none"
     return {"error_type": error_type, "message": message, **kwargs}
 
 

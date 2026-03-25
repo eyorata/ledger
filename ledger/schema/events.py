@@ -25,6 +25,27 @@ import json
 from pydantic import BaseModel, Field
 
 
+class StreamMetadata(BaseModel):
+    stream_id: str
+    aggregate_type: str
+    current_version: int
+    created_at: datetime | None = None
+    archived_at: datetime | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class StoredEvent(BaseModel):
+    event_id: UUID
+    stream_id: str
+    stream_position: int
+    global_position: int | None = None
+    event_type: str
+    event_version: int = 1
+    payload: dict[str, Any]
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    recorded_at: datetime | None = None
+
+
 # ─── ENUMS ───────────────────────────────────────────────────────────────────
 
 class RiskTier(str, Enum):
